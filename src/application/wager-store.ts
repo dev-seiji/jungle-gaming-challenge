@@ -42,6 +42,11 @@ export class DuplicateTransactionError extends Error {
   override name = 'DuplicateTransactionError';
 }
 
+/** A mesma mensagem da fila foi processada por outro consumidor ao mesmo tempo (PK do inbox barrou). */
+export class DuplicateMessageError extends Error {
+  override name = 'DuplicateMessageError';
+}
+
 /** Já existe wallet para esse jogador nessa moeda (unique no banco). */
 export class WalletAlreadyExistsError extends Error {
   override name = 'WalletAlreadyExistsError';

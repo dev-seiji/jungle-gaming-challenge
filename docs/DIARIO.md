@@ -371,6 +371,69 @@ No Docker: `docker compose up → app roda migration:up → sobe o Nest`. Valida
 
 ---
 
+## Fase 6 — Consumidor SQS
+
+### O que foi feito
+
+- `WagerConsumer`: um worker **dentro do app** que lê a `wager-transactions.fifo` e chama **o mesmo caso de uso do HTTP** (`ProcessWagerTransaction`), passando o registro de inbox para entrar no mesmo commit.
+- Deduplicação pelo inbox, com ack **só depois do commit**, e três tipos de erro:
+  - negócio = ack;
+  - transitório = retry com backoff;
+  - permanente = DLQ na hora.
+- **Limite de tentativas:** 5 entregas (`maxReceiveCount` da fila), com espera de 15s, 30s, 60s e 120s entre elas. Esgotou, a redrive policy leva a mensagem para a DLQ.
+- **SIGTERM:** o worker para de buscar, cancela o long polling, termina a mensagem em andamento e devolve as não iniciadas (visibilidade 0).
+- 8 testes de integração com SQS real, mais o teste ponta a ponta no Docker (mensagem enviada pelo terminal, consumida pelo app).
+- **Dois bugs de infraestrutura encontrados e corrigidos** (detalhes abaixo): o SIGTERM não chegava ao app no Docker, e os workers em segundo plano disputavam mensagens com os testes.
+
+### Fluxo
+
+`ReceiveMessage (até 10, long polling 5s) → JSON no formato do enunciado? não = DLQ → inbox já tem (consumer, messageId)? sim = ack → ProcessWagerTransaction(cmd, { inbox }) → COMMIT → ack (DeleteMessage)`
+`erro: duplicata (PK do inbox) = ack / entrada inválida ou conflito de idempotência = DLQ / transitório ou desconhecido = ChangeMessageVisibility(15s · 2^(n-1)) → depois da 5ª entrega, a redrive manda para a DLQ`
+
+### Conceitos novos
+
+- **Inbox (dedup na entrada).** Uma tabela com "(consumidor, messageId) já processado", gravada **no mesmo commit** do efeito financeiro. Se o commit acontece, o inbox existe. Se não acontece, nenhum dos dois existe. Então "já vi essa mensagem" é sempre verdade.
+  *Analogia:* carimbo de "pago" no boleto, dado no mesmo momento do pagamento. Se alguém apresentar o boleto de novo, o carimbo mostra que já foi pago.
+- **Ack depois do commit.** Apagar a mensagem da fila só depois de o banco confirmar. Se apagasse antes e o processo morresse, a operação se perderia. Apagando depois, o pior caso é processar de novo, e o inbox e a idempotência transformam isso em "só confirma".
+- **Visibility timeout como backoff.** Em vez de dormir dentro do worker, ele "esconde" a mensagem da fila por N segundos (`ChangeMessageVisibility`). Enquanto isso, o worker fica livre para outras mensagens, e qualquer instância pode pegá-la depois.
+- **DLQ (Dead Letter Queue).** Destino das mensagens que não vão dar certo, para investigação, sem travar a fila. Nada some: dá para reprocessar depois.
+- **PID 1 e sinais em container.** O Docker manda SIGTERM só para o processo de PID 1. Se o PID 1 for um `sh` que não repassa o sinal, o app nunca fica sabendo e é morto à força (SIGKILL, código de saída 137).
+
+### Decisões e alternativas descartadas
+
+- **Conflito de idempotência vindo da fila vai para a DLQ** (decisão do Gabriel). É erro do provedor que precisa de investigação; dar ack e esquecer apagaria a evidência.
+- **Limite e backoff** (decisão do Gabriel): 5 entregas, com 15s, 30s, 60s e 120s entre elas (~4 min no total). Isso cobre um Postgres reiniciando ou um lock timeout. Algo que passa de 4 min é incidente e vai para a DLQ, sem perda.
+- **Erro desconhecido (bug) é tratado como transitório:** tenta de novo e, se continuar falhando, o limite da fila leva para a DLQ. Assim um bug não vira perda nem loop infinito.
+- **Permanente vai para a DLQ manualmente (SendMessage + Delete),** sem esperar as 5 entregas: reenviar uma mensagem malformada nunca vai funcionar. Primeiro copia, depois apaga. Se cair no meio, a mensagem reaparece; nunca some.
+- **Checagem do inbox antes de chamar o caso de uso,** para que uma reentrega de algo já commitado nem abra transação. Duas cópias **simultâneas** ainda podem passar pela checagem juntas, e aí a PK do inbox barra a segunda (vira `DuplicateMessageError` = ack).
+- **Correção 1 — o SIGTERM não chegava ao app no Docker.** Medindo o `docker compose stop`, o container saía com o **código 137** (morto à força). Investigando, o PID 1 era o `sh -c "migrate && bun ..."`, e o `sh` não repassa o SIGTERM. Solução: `exec bun src/main.ts`, para o bun virar o PID 1. Depois disso, o desligamento foi limpo: 1,0s e código de saída 0. Sem essa correção, todo o tratamento de shutdown do publisher e do consumidor era inútil em produção.
+- **Correção 2 — o shutdown esperava o long polling.** Ao fechar o app, o consumidor esperava a consulta à fila terminar (até 5s), e os testes que sobem o app estouravam o limite de 5s. Solução: o `stop()` cancela a espera com um `AbortController`. O processamento em andamento não é cancelado, só a espera por mensagens novas.
+- **Correção 3 — teste instável na suíte completa.** Os testes que sobem o app inteiro (health, http) ligavam também o consumidor e o publisher **em segundo plano**, que disputavam mensagens e eventos com os testes específicos. Isolado, o teste passava 8 de 8; na suíte, falhava às vezes. Solução: esses testes desligam os workers (`SQS_CONSUMER_ENABLED=false`, `OUTBOX_PUBLISHER_ENABLED=false`). A suíte completa passou 5 de 5 depois disso.
+- **Testes provam que testam:** fazendo o consumidor dar ack numa falha transitória, 2 testes falham (a mensagem se perderia).
+
+### Perguntas prováveis da banca
+
+- **"O que acontece se o worker morrer depois do commit e antes do ack?"** O SQS reentrega a mensagem quando a visibilidade expira. O inbox, gravado no mesmo commit, diz que ela já foi processada, então o worker só dá ack. Teste: commit com inbox, sem ack, reentrega; o resultado é um débito só e o saldo bate com o ledger.
+- **"Como você diferencia erro de negócio, transitório e permanente?"**
+  - Negócio (saldo insuficiente, referência inválida) é um resultado: a transação fica REJECTED, gravada, e a mensagem recebe ack. Tentar de novo dá o mesmo resultado.
+  - Transitório (banco fora, lock_timeout): a mensagem é escondida com backoff e tenta de novo.
+  - Permanente (formato inválido, conflito de idempotência): vai para a DLQ na hora.
+- **"E se o SQS entregar a mesma mensagem duas vezes ao mesmo tempo, para duas instâncias?"** As duas podem passar pela checagem do inbox. A primeira faz commit; a segunda bate na PK do inbox, e o rollback desfaz tudo dela, então ela só dá ack. Mesmo sem o inbox, a idempotency key e o lock da wallet impediriam o débito duplo (defesa em camadas).
+- **"Como o app desliga sem perder nada?"** No SIGTERM, ele para de buscar mensagens, termina a que está processando (que faz commit e ack) e devolve as não iniciadas com visibilidade 0, para outra instância pegar na hora. No Docker, isso só funciona porque o bun é o PID 1 (`exec`).
+
+### Arquivos principais da fase
+
+- `src/infrastructure/messaging/wager-consumer.ts`: o consumidor (recebe, classifica, ack/retry/DLQ, stop).
+- `src/application/wager-store.ts`: o erro `DuplicateMessageError`.
+- `src/infrastructure/persistence/postgres-wager-store.ts`: traduz a violação da PK do inbox em `DuplicateMessageError`.
+- `src/infrastructure/persistence/postgres-queries.ts`: `isMessageProcessed` (consulta ao inbox).
+- `src/app.module.ts`: registra o consumidor.
+- `docker-compose.yml`: `exec bun`, para o SIGTERM chegar ao app.
+- `test/health.test.ts` / `test/integration/http.test.ts`: desligam os workers em segundo plano.
+- `test/integration/wager-consumer.test.ts`: 8 testes (caminho feliz, redelivery, worker morto antes do ack, rejeição de negócio, transitório, limite → DLQ, permanente → DLQ, stop).
+
+---
+
 ## Pendências (fazer se sobrar tempo)
 
-- [ ] **Banco separado para os testes** (ex.: `wagering_test` no mesmo Postgres). Hoje o container `app` usa o mesmo banco dos testes e precisa estar parado durante o `bun test` (`docker compose stop app`), senão o publisher dele disputa os eventos com o teste da outbox. Com um banco de teste, `docker compose up` e `bun test` rodariam juntos.
+- [ ] **Banco separado para os testes** (vale também para o consumidor SQS da Fase 6, que tem a mesma restrição) (ex.: `wagering_test` no mesmo Postgres). Hoje o container `app` usa o mesmo banco dos testes e precisa estar parado durante o `bun test` (`docker compose stop app`), senão o publisher dele disputa os eventos com o teste da outbox. Com um banco de teste, `docker compose up` e `bun test` rodariam juntos.

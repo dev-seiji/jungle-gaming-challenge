@@ -42,4 +42,6 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       ministack: { condition: service_healthy }
-    command: ["sh", "-c", "bun scripts/migrate.ts up && bun src/main.ts"]
+    # `exec`: o bun SUBSTITUI o sh e vira o PID 1. Sem isso o SIGTERM do `docker stop` ia para o sh,
+    # que não repassa o sinal — o app nunca desligava limpo e era morto à força (exit 137).
+    command: ["sh", "-c", "bun scripts/migrate.ts up && exec bun src/main.ts"]

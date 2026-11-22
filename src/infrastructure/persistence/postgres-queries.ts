@@ -3,7 +3,7 @@ import type { EntityManager } from '@mikro-orm/postgresql';
 import { InvalidInputError } from '../../domain/errors';
 import type { MoneyProps } from '../../domain/money';
 import { isUuid } from '../../domain/uuid';
-import { LedgerEntryRecord, WagerTransactionRecord, WalletRecord } from './records';
+import { InboxRecord, LedgerEntryRecord, WagerTransactionRecord, WalletRecord } from './records';
 
 // Consultas só de leitura (não passam pelo domínio: não mudam estado, só montam a resposta).
 
@@ -65,6 +65,12 @@ export class PostgresQueries {
   async getTransactionByExternalId(providerId: string, externalTransactionId: string) {
     const t = await this.em().findOne(WagerTransactionRecord, { providerId, externalTransactionId });
     return t ? transactionView(t) : undefined;
+  }
+
+  /** O consumidor já processou (e fez commit de) essa mensagem? */
+  async isMessageProcessed(consumerName: string, messageId: string): Promise<boolean> {
+    const count = await this.em().count(InboxRecord, { consumerName, messageId, processedAt: { $ne: null } });
+    return count > 0;
   }
 
   /** Saldo gravado x saldo reconstruído pelo ledger. Não corrige nada: só mede e reporta. */

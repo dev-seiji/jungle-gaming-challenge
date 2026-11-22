@@ -1,6 +1,7 @@
 import { LockMode, type MikroORM, UniqueConstraintViolationException } from '@mikro-orm/core';
 import type { EntityManager } from '@mikro-orm/postgresql';
 import {
+  DuplicateMessageError,
   DuplicateTransactionError,
   type StoredTransaction,
   type WagerStore,
@@ -34,10 +35,19 @@ export class PostgresWagerStore implements WagerStore {
     // fork(): Identity Map próprio para esta execução — nada de entidade "velha" vinda de outra requisição.
     const em = this.orm.em.fork() as EntityManager;
     // transactional(): BEGIN, roda o callback, faz flush (Unit of Work grava tudo) e COMMIT; erro = ROLLBACK.
-    return em.transactional(async (txEm) => {
-      await txEm.execute(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT}'`);
-      return work(new PostgresUnitOfWork(txEm));
-    });
+    try {
+      return await em.transactional(async (txEm) => {
+        await txEm.execute(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT}'`);
+        return work(new PostgresUnitOfWork(txEm));
+      });
+    } catch (error) {
+      // Duas entregas da MESMA mensagem processadas ao mesmo tempo: a PK do inbox barrou a segunda
+      // (e o rollback desfez tudo dela). Para o consumidor isso é "já processada": ack.
+      if (error instanceof UniqueConstraintViolationException && error.message.includes('inbox_messages_pkey')) {
+        throw new DuplicateMessageError(error.message);
+      }
+      throw error;
+    }
   }
 }
 

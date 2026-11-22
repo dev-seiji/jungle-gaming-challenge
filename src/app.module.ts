@@ -10,6 +10,7 @@ import { ProcessWagerTransaction } from './application/process-wager-transaction
 import { PostgresQueries } from './infrastructure/persistence/postgres-queries';
 import { PostgresWagerStore } from './infrastructure/persistence/postgres-wager-store';
 import { OutboxPublisher } from './infrastructure/messaging/outbox-publisher';
+import { WagerConsumer } from './infrastructure/messaging/wager-consumer';
 import { AuthGuard } from './http/auth.guard';
 import { HttpErrorFilter } from './http/http-error.filter';
 import { WageringController } from './http/wagering.controller';
@@ -30,6 +31,11 @@ import { WalletsController } from './http/wallets.controller';
       provide: OutboxPublisher,
       useFactory: (orm: MikroORM, sqs: SQSClient) => new OutboxPublisher(orm, sqs),
       inject: [MikroORM, SQSClient],
+    },
+    {
+      provide: WagerConsumer,
+      useFactory: (p: ProcessWagerTransaction, q: PostgresQueries, sqs: SQSClient) => new WagerConsumer(p, q, sqs),
+      inject: [ProcessWagerTransaction, PostgresQueries, SQSClient],
     },
     { provide: APP_FILTER, useClass: HttpErrorFilter },
     AuthGuard,
