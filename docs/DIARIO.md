@@ -248,3 +248,63 @@ No Docker: `docker compose up → app roda migration:up → sobe o Nest`. Valida
 - `src/mikro-orm.config.ts`: registra os schemas e desliga o snapshot.
 - `test/integration/helpers.ts`: cria wallets com lançamento de abertura e confere o invariante `saldo == ledger`.
 - `test/integration/process-wager-transaction.test.ts`: 20 testes (concorrência, idempotência, regras, atomicidade).
+
+---
+
+## Fase 4 — API HTTP
+
+### O que foi feito
+
+- Criei todos os endpoints da seção 9 do enunciado: criar e consultar wallet, extrato paginado por cursor, submeter e consultar transação (pelo id interno e pelo id do provedor) e reconciliação.
+- `POST /wallets` cria wallet + transação `OPENING` + lançamento CREDIT + eventos, **na mesma transação SQL** (caso de uso `CreateWallet`).
+- O mapeamento de status HTTP fica num lugar só, o filtro de erros, por isso é igual em todos os endpoints.
+- Criei o `AuthGuard` no-op como ponto de extensão da autenticação.
+- 18 testes pela HTTP real, mais um teste manual com `curl` no app rodando no Docker.
+
+### Fluxo
+
+`Requisição → AuthGuard (no-op) → controller valida o formato (400) → caso de uso → resultado: PROCESSED=200 / PENDING_REFERENCE=202 / REJECTED=422 → [erro?] HttpErrorFilter: entrada inválida=400, conflito=409, transitório=503, inesperado=500`
+
+### Conceitos novos
+
+- **Paginação por cursor x por OFFSET.** Com `OFFSET 50`, se um lançamento novo entra enquanto o cliente lê, as páginas "andam" e itens se repetem ou somem. Com o cursor ("me dê os depois do id X"), a próxima página começa exatamente onde a anterior parou. Funciona porque o id é UUIDv7 (cresce com o tempo) e o ledger é append-only.
+  *Analogia:* marcador de livro (cursor) x "página 50" num livro em que alguém continua inserindo páginas.
+- **Cursor opaco.** O cliente recebe uma string codificada (base64url do id) e só a devolve. Assim podemos mudar o formato interno sem quebrar ninguém.
+- **Exception filter (NestJS).** Um único ponto que pega qualquer erro e decide o status. Os controllers não têm `try/catch` espalhado.
+- **Erro transitório x permanente.** Transitório é aquilo que, tentando de novo, pode dar certo (banco reiniciando, lock demorando): responde **503** com `retryable: true`. Permanente é aquilo que, tentando de novo, dá o mesmo resultado: 400, 409, 422.
+
+### Decisões e alternativas descartadas
+
+- **Mesmo status na primeira vez e no replay** (decisão do Gabriel): PROCESSED é sempre 200, rejeição é sempre 422. O enunciado pede "requisição idêntica → mesma resposta". Usar 201 e depois 200 mudaria a resposta. Quem diferencia é o campo `idempotentReplay`. Só a criação de wallet é 201, porque ela não tem replay.
+- **Rejeição de negócio é resultado, não exceção.** O caso de uso devolve `REJECTED` + `failureCode` normalmente, e o controller responde 422 com o corpo completo (transactionId, failureCode, saldo). Assim o provedor tem tudo para decidir.
+- **Campo `retryable` nos erros:** o provedor decide se pode reenviar sem interpretar a mensagem (o enunciado pede isso explicitamente).
+- **O MikroORM 7 não tem exceção própria para lock timeout (`55P03`).** Descobri lendo o conversor de erros do MikroORM: o erro chega como `DriverException` genérica. A função `isTransientDbError` classifica pelo código SQLSTATE (lock, deadlock, Postgres reiniciando, conexão). Ela vai ser reaproveitada na fila (Fase 6), para decidir entre retry e DLQ.
+- **Id malformado na URL responde 404 (não existe), e não 500.** Sem a checagem, o Postgres daria erro de sintaxe de UUID.
+- **Consultas só de leitura (`PostgresQueries`) não passam pelo domínio:** não mudam estado, só montam a resposta.
+- **Reconciliação não corrige:** ela mede, loga um aviso e devolve `consistent: false`. Corrigir em silêncio esconderia o bug que causou a divergência. Testado: depois da reconciliação, o saldo continua divergente, esperando investigação.
+- **Abertura de wallet emite `WagerTransactionProcessed` (OPENING) e `WalletBalanceChanged`** (o saldo foi de 0 para o valor inicial). Wallet aberta com 0 não gera transação, lançamento nem evento.
+- **Casos de uso continuam sem decorators do Nest.** O `app.module.ts` os monta com `useFactory`. O NestJS fica só na borda (controllers, filtro, guard).
+- **O teste de 503 testa a função de mapeamento diretamente.** Derrubar o banco no meio de um teste HTTP seria lento e instável; a queda real do Postgres entra no teste de reinício (Fase 9).
+
+### Perguntas prováveis da banca
+
+- **"Como o provedor sabe se pode reenviar?"** Pelo status: 503 = sim, com a mesma Idempotency-Key (é seguro, porque vira replay); 400, 409 e 422 = não adianta reenviar igual. O corpo também traz `retryable`.
+- **"Por que 422 e não 400 para saldo insuficiente?"** 400 significa "seu payload está mal formado". 422 significa "o payload está certo, mas a regra de negócio recusou". Se os dois usassem o mesmo código, o provedor teria que ler a mensagem para saber se o erro é dele ou do saldo do jogador.
+- **"Por que paginação por cursor?"** Porque o extrato cresce enquanto é lido. Com OFFSET, itens se repetiriam ou sumiriam entre as páginas. O teste insere um lançamento **no meio** da paginação e prova que nenhum item é repetido ou perdido.
+- **"E a autenticação?"** Não foi implementada (vale 0 pontos), mas o ponto de extensão existe (`AuthGuard`), e o desenho com Keycloak (JWT do provedor, validação por JWKS, `providerId` do token = `providerId` do corpo) vai no `ARCHITECTURE.md`.
+
+### Arquivos principais da fase
+
+- `src/application/create-wallet.ts`: cria wallet + OPENING + ledger + eventos numa transação.
+- `src/domain/wager-transaction.ts`: ganhou a factory `opening()`.
+- `src/domain/wallet.ts`: `openingTransactionId` virou opcional (só é exigido com saldo > 0).
+- `src/domain/uuid.ts`: validação de UUID compartilhada.
+- `src/application/wager-store.ts`: a porta ganhou `addWallet` e o erro `WalletAlreadyExistsError`.
+- `src/infrastructure/persistence/postgres-wager-store.ts`: implementa o `addWallet` (unique → 409).
+- `src/infrastructure/persistence/postgres-queries.ts`: leituras, extrato por cursor e reconciliação.
+- `src/infrastructure/persistence/transient-errors.ts`: decide o que é falha transitória.
+- `src/http/http-error.filter.ts`: erro → status HTTP, num lugar só.
+- `src/http/wallets.controller.ts` / `wagering.controller.ts`: os endpoints e a validação de formato.
+- `src/http/auth.guard.ts`: o ponto de extensão da autenticação.
+- `src/app.module.ts`: monta tudo.
+- `test/integration/http.test.ts`: 18 testes pela HTTP real.

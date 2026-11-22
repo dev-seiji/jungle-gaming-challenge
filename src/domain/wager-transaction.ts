@@ -99,6 +99,35 @@ export class WagerTransaction {
     return WagerTransaction.rehydrate({ ...props, id: Bun.randomUUIDv7(), status: WagerTransactionStatus.Pending });
   }
 
+  /**
+   * Transação interna de abertura da wallet (nunca vem do provedor).
+   * Chaves determinísticas por wallet: "internal" não colide com provider real e a abertura é única.
+   */
+  static opening(props: {
+    walletId: string;
+    playerId: string;
+    money: Money;
+    payloadHash: string;
+    createdAt: Date;
+  }): WagerTransaction {
+    if (!props.money.isPositive()) throw new InvalidInputError('opening amount must be greater than zero');
+    return WagerTransaction.rehydrate({
+      id: Bun.randomUUIDv7(),
+      providerId: 'internal',
+      externalTransactionId: `opening:${props.walletId}`,
+      idempotencyKey: `internal:opening:${props.walletId}`,
+      payloadHash: props.payloadHash,
+      walletId: props.walletId,
+      playerId: props.playerId,
+      roundId: 'opening',
+      gameId: 'opening',
+      kind: WagerTransactionKind.Opening,
+      money: props.money,
+      createdAt: props.createdAt,
+      status: WagerTransactionStatus.Pending,
+    });
+  }
+
   /** Reconstrução a partir da persistência: não revalida transições. */
   static rehydrate(s: WagerTransactionState): WagerTransaction {
     return new WagerTransaction(

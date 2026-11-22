@@ -5,6 +5,7 @@ import {
   type StoredTransaction,
   type WagerStore,
   type WagerUnitOfWork,
+  WalletAlreadyExistsError,
 } from '../../application/wager-store';
 import type { FailureCode } from '../../domain/failure-code';
 import type { InboxMessage } from '../../domain/inbox-message';
@@ -71,6 +72,30 @@ class PostgresUnitOfWork implements WagerUnitOfWork {
       kind: { $in: ['REFUND', 'ROLLBACK'] },
     });
     return count > 0;
+  }
+
+  async addWallet(wallet: Wallet): Promise<void> {
+    this.em.persist(
+      Object.assign(new WalletRecord(), {
+        id: wallet.id,
+        playerId: wallet.playerId,
+        currency: wallet.currency,
+        balance: wallet.balance.toJSON().amount,
+        version: wallet.version,
+        createdAt: wallet.createdAt,
+        updatedAt: wallet.updatedAt,
+      }),
+    );
+    // Flush imediato: a OPENING e o ledger têm FK para a wallet, e a unique (player_id, currency)
+    // é quem garante "uma wallet por jogador e moeda" mesmo com dois POST /wallets simultâneos.
+    try {
+      await this.em.flush();
+    } catch (error) {
+      if (error instanceof UniqueConstraintViolationException && error.message.includes('wallets_player_currency_uq')) {
+        throw new WalletAlreadyExistsError(`player ${wallet.playerId} already has a ${wallet.currency} wallet`);
+      }
+      throw error;
+    }
   }
 
   async addTransaction(transaction: WagerTransaction, observedBalance?: Money): Promise<void> {

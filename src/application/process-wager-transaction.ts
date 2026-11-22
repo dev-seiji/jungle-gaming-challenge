@@ -12,6 +12,7 @@ import { InboxMessage } from '../domain/inbox-message';
 import { Money, type MoneyProps } from '../domain/money';
 import { OutboxMessage } from '../domain/outbox-message';
 import { payloadHash } from '../domain/payload-hash';
+import { isUuid } from '../domain/uuid';
 import { WagerTransaction, type WagerTransactionKind, type WagerTransactionStatus } from '../domain/wager-transaction';
 import type { Wallet } from '../domain/wallet';
 import { LedgerDirection } from '../domain/wallet-ledger-entry';
@@ -22,8 +23,6 @@ import {
   type WagerStore,
   type WagerUnitOfWork,
 } from './wager-store';
-
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Entrada comum do HTTP e da fila. */
 export interface ProcessWagerCommand {
@@ -75,7 +74,7 @@ export class ProcessWagerTransaction {
 
   private buildTransaction(command: ProcessWagerCommand): WagerTransaction {
     // walletId é id interno (uuid no banco): sem isso, um id malformado viraria erro de SQL em vez de 400.
-    if (!UUID.test(String(command.walletId))) throw new InvalidInputError('walletId must be a UUID');
+    if (!isUuid(command.walletId)) throw new InvalidInputError('walletId must be a UUID');
     const money = Money.from(command.money);
     // Hash só dos campos de negócio (sem idempotencyKey, que é a própria chave, nem metadados de transporte).
     // Money normalizado via toJSON: "025.00" e "25.00" são o mesmo valor.

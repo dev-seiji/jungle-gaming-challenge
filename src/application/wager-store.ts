@@ -23,6 +23,8 @@ export interface WagerUnitOfWork {
   /** A referência já tem uma reversão (REFUND/ROLLBACK) aplicada? */
   isAlreadyReversed(referenceTransactionId: string): Promise<boolean>;
 
+  /** Lança WalletAlreadyExistsError se já existe wallet para (playerId, currency). */
+  addWallet(wallet: Wallet): Promise<void>;
   addTransaction(transaction: WagerTransaction, observedBalance?: Money): Promise<void>;
   saveWallet(wallet: Wallet): void;
   addLedgerEntry(entry: WalletLedgerEntry): void;
@@ -38,6 +40,11 @@ export interface WagerStore {
 /** Duas requisições criaram a mesma transação ao mesmo tempo; quem perdeu deve repetir e virar replay. */
 export class DuplicateTransactionError extends Error {
   override name = 'DuplicateTransactionError';
+}
+
+/** Já existe wallet para esse jogador nessa moeda (unique no banco). */
+export class WalletAlreadyExistsError extends Error {
+  override name = 'WalletAlreadyExistsError';
 }
 
 /** Mesma idempotency key (ou mesmo externalTransactionId) com conteúdo diferente: conflito, não replay. */

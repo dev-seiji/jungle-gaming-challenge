@@ -32,13 +32,15 @@ export class Wallet {
     id: string;
     playerId: string;
     initialBalance: Money;
-    openingTransactionId: string;
+    /** Obrigatório quando o saldo inicial é > 0 (id da transação OPENING). */
+    openingTransactionId?: string;
     at: Date;
   }): { wallet: Wallet; openingEntry?: WalletLedgerEntry } {
     if (props.initialBalance.isNegative()) throw new InvalidInputError('initial balance cannot be negative');
     const { initialBalance: balance, at } = props;
     const wallet = new Wallet(props.id, props.playerId, balance.currency, balance, 1, at, at);
     if (balance.isZero()) return { wallet };
+    if (!props.openingTransactionId) throw new Error('a positive initial balance needs an OPENING transaction id');
     const openingEntry = WalletLedgerEntry.create({
       walletId: wallet.id,
       transactionId: props.openingTransactionId,
