@@ -50,7 +50,6 @@ export class WagerConsumer {
   private urls?: { commands: string; deadLetter: string };
   private running = false;
   private loop?: Promise<void>;
-  private abort = new AbortController();
 
   constructor(
     private readonly processWager: ProcessWagerTransaction,
@@ -72,9 +71,13 @@ export class WagerConsumer {
         WaitTimeSeconds: this.waitTimeSeconds, // long polling: não fica martelando a fila vazia
         MessageSystemAttributeNames: ['ApproximateReceiveCount', 'MessageGroupId'],
       }),
-      // No stop, a espera do long polling é cancelada: o shutdown não fica preso até 5s esperando a fila.
-      { abortSignal: this.abort.signal },
     );
+    // O long polling NÃO é cancelado no stop, de propósito: cancelar só fecha o lado do cliente, e o
+    // servidor do SQS ainda entregaria mensagens a essa conexão morta (escondidas até o visibility timeout,
+    // 30s). Esperando o poll terminar (até WaitTimeSeconds), o que vier é devolvido na hora (releaseAll).
+    if (messages.length > 0) {
+      this.logger.log({ msg: 'received batch', count: messages.length, sqsMessageIds: messages.map((m) => m.MessageId) });
+    }
     for (const [i, message] of messages.entries()) {
       if (this.stopRequested) {
         // SIGTERM: não começa mensagem nova; devolve as restantes para outra instância pegar já.
@@ -191,14 +194,15 @@ export class WagerConsumer {
   start(): void {
     if (this.running) return;
     this.running = true;
-    this.abort = new AbortController();
     this.loop = this.run();
   }
 
-  /** SIGTERM: para de buscar, termina a mensagem em andamento, devolve as não iniciadas. */
+  /**
+   * SIGTERM: para de buscar, termina a mensagem em andamento e devolve as não iniciadas.
+   * Pode levar até WaitTimeSeconds (5s) esperando o poll em curso — dentro dos 10s que o Docker dá antes do SIGKILL.
+   */
   async stop(): Promise<void> {
     this.running = false;
-    this.abort.abort(); // só interrompe a ESPERA por mensagens; o processamento em andamento não usa esse sinal
     await this.loop;
   }
 
@@ -207,8 +211,7 @@ export class WagerConsumer {
       try {
         await this.pollOnce();
       } catch (error) {
-        if (!this.running) break; // receive cancelado pelo stop: saída normal
-        this.logger.error(`poll failed: ${(error as Error).message}`);
+        this.logger.error({ msg: 'poll failed', error: (error as Error).message });
         await Bun.sleep(1_000); // SQS fora do ar: não entra em loop apertado
       }
     }

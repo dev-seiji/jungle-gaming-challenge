@@ -45,3 +45,6 @@ services:
     # `exec`: o bun SUBSTITUI o sh e vira o PID 1. Sem isso o SIGTERM do `docker stop` ia para o sh,
     # que não repassa o sinal — o app nunca desligava limpo e era morto à força (exit 137).
     command: ["sh", "-c", "bun scripts/migrate.ts up && exec bun src/main.ts"]
+    # Prazo entre o SIGTERM e o SIGKILL. Explícito (o padrão variou entre versões; aqui deu 3s): o consumidor
+    # espera o long polling em curso (até 5s) para devolver mensagens em vez de deixá-las escondidas por 30s.
+    stop_grace_period: 15s

@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "start": "bun src/main.ts",
-    "test": "bun test",
+    "test": "bun test test/unit test/integration test/health.test.ts",
+    "test:multi": "bun test test/multi-instance",
     "typecheck": "tsc --noEmit",
     "migration:up": "bun scripts/migrate.ts up",
     "migration:down": "bun scripts/migrate.ts down"

@@ -407,7 +407,7 @@ No Docker: `docker compose up → app roda migration:up → sobe o Nest`. Valida
 - **Permanente vai para a DLQ manualmente (SendMessage + Delete),** sem esperar as 5 entregas: reenviar uma mensagem malformada nunca vai funcionar. Primeiro copia, depois apaga. Se cair no meio, a mensagem reaparece; nunca some.
 - **Checagem do inbox antes de chamar o caso de uso,** para que uma reentrega de algo já commitado nem abra transação. Duas cópias **simultâneas** ainda podem passar pela checagem juntas, e aí a PK do inbox barra a segunda (vira `DuplicateMessageError` = ack).
 - **Correção 1 — o SIGTERM não chegava ao app no Docker.** Medindo o `docker compose stop`, o container saía com o **código 137** (morto à força). Investigando, o PID 1 era o `sh -c "migrate && bun ..."`, e o `sh` não repassa o SIGTERM. Solução: `exec bun src/main.ts`, para o bun virar o PID 1. Depois disso, o desligamento foi limpo: 1,0s e código de saída 0. Sem essa correção, todo o tratamento de shutdown do publisher e do consumidor era inútil em produção.
-- **Correção 2 — o shutdown esperava o long polling.** Ao fechar o app, o consumidor esperava a consulta à fila terminar (até 5s), e os testes que sobem o app estouravam o limite de 5s. Solução: o `stop()` cancela a espera com um `AbortController`. O processamento em andamento não é cancelado, só a espera por mensagens novas.
+- **Correção 2 — o shutdown esperava o long polling.** ⚠️ *Desfeita na Fase 9: cancelar o poll no cliente fazia o servidor esconder mensagens por 30s (ver Fase 9).* Ao fechar o app, o consumidor esperava a consulta à fila terminar (até 5s), e os testes que sobem o app estouravam o limite de 5s. Solução: o `stop()` cancela a espera com um `AbortController`. O processamento em andamento não é cancelado, só a espera por mensagens novas.
 - **Correção 3 — teste instável na suíte completa.** Os testes que sobem o app inteiro (health, http) ligavam também o consumidor e o publisher **em segundo plano**, que disputavam mensagens e eventos com os testes específicos. Isolado, o teste passava 8 de 8; na suíte, falhava às vezes. Solução: esses testes desligam os workers (`SQS_CONSUMER_ENABLED=false`, `OUTBOX_PUBLISHER_ENABLED=false`). A suíte completa passou 5 de 5 depois disso.
 - **Testes provam que testam:** fazendo o consumidor dar ack numa falha transitória, 2 testes falham (a mensagem se perderia).
 
@@ -549,6 +549,66 @@ No Docker: `docker compose up → app roda migration:up → sobe o Nest`. Valida
 - Instrumentação: `wagering.controller.ts`, `wallets.controller.ts` (reconciliação), `wager-consumer.ts`, `outbox-publisher.ts`, `pending-reference-worker.ts`, `postgres-wager-store.ts` (lock).
 - `src/application/resolve-pending-reference.ts`: `runOnce` devolve o resultado (para o worker contar).
 - `test/integration/observability.test.ts`: métricas mudando com BET, replay e rejeição; log JSON sem valores.
+
+---
+
+## Fase 9 — Várias instâncias e recuperação
+
+### O que foi feito
+
+- Criei um teste com **3 processos reais do app** (`bun src/main.ts` nas portas 3101, 3102 e 3103), com todos os workers ligados, sobre o mesmo Postgres e MiniStack. Ele roda com `bun run test:multi`.
+- 6 cenários, todos terminando com `saldo == ledger` (pelo endpoint de reconciliação):
+  1. wallet "quente" atacada pelas 3 instâncias;
+  2. a mesma BET 30x espalhada entre elas;
+  3. 30 mensagens consumidas pelos 3 consumidores, com a outbox esvaziada pelos 3 publishers;
+  4. `kill -9` no meio da carga, com o provedor reenviando tudo;
+  5. lock preso por mais de 5s (503 + métrica de timeout);
+  6. Postgres parado e religado (503 durante a queda, recuperação sozinha).
+- O `bun run test` passou a rodar só os testes rápidos (unidade + integração). O `test:multi` é separado porque leva ~12s e reinicia o Postgres.
+- **Um bug real da Fase 6 apareceu e foi corrigido:** o SIGTERM do consumidor escondia mensagens por 30s (detalhes abaixo).
+
+### Fluxo (cenário do kill -9)
+
+`40 BETs disparadas na instância A → kill -9 no meio (parte fica sem resposta) → A reinicia → o provedor reenvia as 40 (mesma key) → as já commitadas viram replay; as perdidas são processadas → 40 débitos, nem mais nem menos`
+
+### Conceitos novos
+
+- **Teste com processos reais.** Cada instância tem o seu próprio pool de conexões, publisher, consumidor e worker. Se alguma garantia dependesse de memória do processo, esse teste falharia. Todas as garantias moram no Postgres (locks, constraints, inbox), então o teste passa.
+- **`kill -9` x SIGTERM.** O SIGTERM pede para o processo sair (dá tempo de terminar o que está fazendo). O `kill -9` (SIGKILL) mata na hora, sem chance de reagir. O sistema precisa aguentar os dois: o primeiro com shutdown limpo, o segundo com transações atômicas + idempotência + visibility timeout.
+- **Long polling e conexões "zumbis".** No long polling, o servidor do SQS segura a requisição até chegar mensagem (ou até o tempo de espera acabar). Se o cliente desiste ou morre, o servidor **não fica sabendo** e pode entregar mensagens para a conexão morta. Elas ficam invisíveis até o visibility timeout.
+  *Analogia:* deixar o telefone fora do gancho. Quem liga ouve "chamando", mas ninguém atende, até a ligação cair sozinha.
+- **Recuperação sem reiniciar.** Quando o Postgres cai e volta, o pool de conexões descarta as conexões mortas e abre novas. A API responde 503 durante a queda e volta sozinha, sem reiniciar o app.
+
+### Decisões e alternativas descartadas
+
+- **Processos locais em vez de `docker compose up --scale app=3`** (aprovado pelo Gabriel). O `--scale` daria conflito na porta 3000 e exigiria um balanceador de carga. Com processos locais, controlamos as portas e o `kill -9`, com o mesmo código e o mesmo banco.
+- **Script separado `test:multi`:** reinicia o Postgres e sobe processos, então não deve rodar a cada `bun test`.
+- **O teste garante que o kill pegou o meio da carga:** ele verifica que algumas requisições ficaram sem resposta. Sem isso, o teste poderia passar sem testar nada.
+- **Bug encontrado — o SIGTERM do consumidor escondia mensagens por 30s.** O cenário da fila falhava de forma intermitente (passava na 1ª execução e falhava nas seguintes). Investigação passo a passo:
+  1. **Perda de dados?** Não: no banco, as mensagens "faltantes" foram processadas exatamente **30s depois** (o visibility timeout). Alguém as recebeu e não respondeu.
+  2. **Hipótese 1** (cancelar o poll no mesmo processo engole mensagens): testada isoladamente, **falsa**.
+  3. **Hipótese 2** (o MiniStack marca o grupo FIFO inteiro como "em voo"): testada, **falsa**. Ele entrega o grupo inteiro para um consumidor só, corretamente.
+  4. **Logs:** os da instância suspeita tinham sido apagados (o log era recriado quando a instância reiniciava). Passamos a gravar um arquivo por processo, e o consumidor passou a logar cada lote recebido.
+  5. **Com os logs:** as 3 instâncias receberam exatamente 15 das 30 mensagens. As outras 15 foram para um **4º receptor**: as instâncias da execução anterior, recém-desligadas.
+  6. **Hipótese 3** (um processo que morre com long polling aberto engole a próxima mensagem): testada com um processo separado e `kill`, **verdadeira**. A mensagem ficou `visible: false, receiveCount: 1`, e o consumidor vivo não a recebeu.
+  7. **Causa raiz:** a "correção 2" da Fase 6 (cancelar o long polling no SIGTERM para desligar rápido). Cancelar só fecha o lado do cliente; o servidor seguia entregando mensagens à conexão morta.
+  8. **Correção:** no SIGTERM, o consumidor **espera** o poll terminar (até 5s) e **devolve** o que vier (visibilidade 0), que é o que o enunciado pede. Resultado: **6 de 6 execuções seguidas** passando, contra falhas a cada 2 ou 3 antes.
+- **Bug encontrado em seguida — o Docker matava o app depois de 3s.** Com o shutdown agora levando até 5s, o `docker compose stop` voltou a sair com o código 137. Os eventos do Docker mostraram SIGTERM e, 3s depois, SIGKILL: o prazo padrão nesta versão do Compose era 3s, não os 10s que eu assumia. Correção: `stop_grace_period: 15s` explícito no compose. Depois disso, o código de saída voltou a ser 0 (2,5s e 3,4s).
+- **Com `kill -9` não existe shutdown limpo.** Nesse caso, a mensagem em voo volta depois do visibility timeout (30s) e é processada uma vez, graças ao inbox e à idempotência. Isso é o at-least-once funcionando como esperado.
+
+### Perguntas prováveis da banca
+
+- **"Como você prova que funciona com várias instâncias?"** Com 3 processos reais do app sobre o mesmo banco: 30 apostas concorrentes numa wallet de 100 resultam em exatamente 14 processadas e saldo 2.00; a mesma aposta 30x dá 1 débito; 30 mensagens com 3 consumidores dão cada uma aplicada uma vez. Tudo conferido com a reconciliação.
+- **"E se o processo morrer no meio?"** Teste com `kill -9` no meio de 40 apostas. O que tinha feito commit está gravado; o que não tinha foi desfeito (rollback). O provedor reenvia com as mesmas keys: as commitadas viram replay, as perdidas são processadas. Resultado: 40 débitos, nem mais nem menos.
+- **"E se o banco cair?"** A API responde 503 com `retryable: true` (o primeiro 503 real do projeto), o `/health/ready` responde 503 e o `/health/live` continua 200. Quando o Postgres volta, as instâncias se recuperam sozinhas, e o reenvio é processado.
+- **"Qual foi o bug mais difícil?"** O SIGTERM que escondia mensagens. Mostra o método: hipóteses testadas e descartadas com experimentos, até achar a causa raiz. E mostra uma lição sobre long polling: cancelar no cliente não cancela no servidor.
+
+### Arquivos principais da fase
+
+- `test/multi-instance/multi-instance.test.ts`: os 6 cenários, mais os helpers para subir e matar processos.
+- `package.json`: `test` (rápido) e `test:multi` (várias instâncias).
+- `src/infrastructure/messaging/wager-consumer.ts`: o SIGTERM espera o poll e devolve as mensagens (sem cancelar), e o consumidor loga cada lote recebido.
+- `docker-compose.yml`: `stop_grace_period: 15s`.
 
 ---
 
