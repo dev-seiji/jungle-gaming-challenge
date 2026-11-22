@@ -612,6 +612,32 @@ No Docker: `docker compose up → app roda migration:up → sobe o Nest`. Valida
 
 ---
 
+## Fase 10 — Documentação
+
+### O que foi feito
+
+- **`README.md`:** pré-requisitos, como subir, exemplos com `curl` (wallet, aposta, replay, consultas, fila), tabela de status HTTP, como rodar cada tipo de teste, variáveis de ambiente e estrutura de pastas.
+- **`ARCHITECTURE.md`:** visão geral (diagrama), ORM e mapeamento, `Money`, garantias no schema, estratégia transacional e de concorrência, idempotência e hash, transições de estado, `failureCode`s, mapeamento HTTP, interpretações adotadas, mensageria e limites de retry, observabilidade, autenticação (desenho com Keycloak), testes, trade-offs e limitações.
+- **O README foi executado ao pé da letra, do zero** (`docker compose down -v` + os comandos documentados). Tudo funcionou, inclusive a mensagem pela fila e os dois comandos de teste.
+
+### Decisões
+
+- **Documentação em português,** como o enunciado.
+- **Limitações escritas com honestidade,** sem esconder nada:
+  - o banco dos testes é compartilhado com o app;
+  - as migrations rodam na subida, sem lock: conferimos no código do MikroORM 7 que o migrator não usa lock, então várias instâncias subindo juntas podem disputar a migration;
+  - a transação fica aberta durante o envio ao SQS;
+  - os eventos são at-least-once;
+  - não há teste de carga.
+- **Cada afirmação do ARCHITECTURE.md aponta para um teste ou para uma prova** (os testes de mutação manuais), não para "acreditamos que funciona".
+
+### Arquivos principais da fase
+
+- `README.md`: como rodar e usar.
+- `ARCHITECTURE.md`: por que foi feito assim.
+
+---
+
 ## Pendências (fazer se sobrar tempo)
 
 - [ ] **Banco separado para os testes** (vale também para o consumidor SQS da Fase 6 e o worker de pendentes da Fase 7, que têm a mesma restrição) (ex.: `wagering_test` no mesmo Postgres). Hoje o container `app` usa o mesmo banco dos testes e precisa estar parado durante o `bun test` (`docker compose stop app`), senão o publisher dele disputa os eventos com o teste da outbox. Com um banco de teste, `docker compose up` e `bun test` rodariam juntos.
