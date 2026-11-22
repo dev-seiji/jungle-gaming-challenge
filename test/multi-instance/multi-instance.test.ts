@@ -1,6 +1,6 @@
 // Várias instâncias REAIS do app (processos `bun src/main.ts` separados, cada um com seu pool, publisher,
 // consumidor e worker) sobre o mesmo Postgres e MiniStack do compose. Também derruba e reinicia o Postgres.
-// Rodar com: `docker compose up -d postgres ministack` + `docker compose stop app` + `bun run test:multi`.
+// Rodar com: `docker compose up -d` + `bun run test:multi` (usa o banco e a conta SQS de teste do .env).
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { tmpdir } from 'node:os';
 import { GetQueueUrlCommand, PurgeQueueCommand, SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
@@ -103,11 +103,6 @@ const debits = (walletId: string) =>
 // ---------- ciclo de vida
 
 beforeAll(async () => {
-  const appRunning = await fetch('http://localhost:3000/health/live').then(
-    () => true,
-    () => false,
-  );
-  if (appRunning) throw new Error('stop the app container first: `docker compose stop app`');
   orm = await initOrm();
   await Promise.all(PORTS.map(startInstance));
 }, SLOW);

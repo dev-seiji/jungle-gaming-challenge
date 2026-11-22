@@ -1,5 +1,5 @@
-// Integração real: Postgres + SQS (MiniStack). O container `app` precisa estar PARADO (`docker compose stop app`):
-// ele também consome wager-transactions.fifo e "roubaria" as mensagens dos testes.
+// Integração real: Postgres + SQS (MiniStack), no banco e na conta SQS exclusivos dos testes (ver .env.example),
+// então o container `app` pode ficar de pé sem disputar as mensagens.
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { GetQueueUrlCommand, PurgeQueueCommand, ReceiveMessageCommand, SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 import type { MikroORM } from '@mikro-orm/postgresql';
@@ -14,6 +14,7 @@ import {
 import { PostgresQueries } from '../../src/infrastructure/persistence/postgres-queries';
 import { PostgresWagerStore } from '../../src/infrastructure/persistence/postgres-wager-store';
 import { countRows, createWallet, expectBalanceMatchesLedger, initOrm, ledgerEntries } from './helpers';
+import { SQS_ACCOUNT } from './helpers';
 
 let orm: MikroORM;
 let store: PostgresWagerStore;
@@ -74,7 +75,7 @@ async function send(body: unknown, groupId = 'g') {
 /** Conteúdo atual de uma fila, sem consumir (endpoint de inspeção do MiniStack). */
 async function queued(queueName: string): Promise<{ Body: string; IsVisible: boolean }[]> {
   const res = (await (await fetch(`${process.env.SQS_ENDPOINT}/_ministack/sqs/messages`)).json()) as any;
-  const queues = res.messages['000000000000']['us-east-1'] as Record<string, { Body: string; IsVisible: boolean }[]>;
+  const queues = res.messages[SQS_ACCOUNT]['us-east-1'] as Record<string, { Body: string; IsVisible: boolean }[]>;
   return Object.entries(queues).find(([url]) => url.endsWith(`/${queueName}`))?.[1] ?? [];
 }
 
@@ -82,11 +83,6 @@ const inboxCount = (messageId: string) =>
   countRows(orm, 'inbox_messages', 'consumer_name = ? AND message_id = ?', [CONSUMER_NAME, messageId]);
 
 beforeAll(async () => {
-  const appRunning = await fetch('http://localhost:3000/health/live').then(
-    () => true,
-    () => false,
-  );
-  if (appRunning) throw new Error('stop the app container first: `docker compose stop app` (it would compete for the queue)');
   orm = await initOrm();
   store = new PostgresWagerStore(orm);
   queries = new PostgresQueries(orm);

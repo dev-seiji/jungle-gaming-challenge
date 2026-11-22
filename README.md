@@ -126,9 +126,8 @@ Todos os testes de integração usam **Postgres e SQS (MiniStack) reais** do pr�
 
 ```bash
 bun install
-cp .env.example .env                       # variáveis para rodar fora do Docker (o Bun lê o .env sozinho)
-docker compose up -d postgres ministack
-docker compose stop app                    # ⚠️ ver nota abaixo
+cp .env.example .env      # banco e filas EXCLUSIVOS dos testes (o Bun lê o .env sozinho)
+docker compose up -d      # o app pode ficar de pé: os testes não disputam nada com ele
 ```
 
 | Comando | O que roda | Tempo |
@@ -137,9 +136,11 @@ docker compose stop app                    # ⚠️ ver nota abaixo
 | `bun run test:multi` | **3 processos reais do app** em paralelo, `kill -9` no meio da carga, Postgres parado e religado, lock preso → 503 | ~12 s |
 | `bun run typecheck` | TypeScript strict (`tsc --noEmit`) | ~2 s |
 
-> **⚠️ O container `app` precisa estar parado durante os testes.** Ele usa o mesmo banco e as mesmas filas, e os workers dele disputariam os eventos e as mensagens dos testes. Os testes que dependem disso conferem e param com uma mensagem clara se o app estiver de pé. Um banco separado para testes está listado como melhoria em ARCHITECTURE.md.
-
-> O teste de migrations (`test/integration/schema.test.ts`) derruba e recria o schema, e com isso apaga os dados do banco local.
+> **Isolamento entre testes e app.** Os testes usam um banco próprio (`wagering_test`, criado por `postgres/init/` quando o volume é novo) e uma conta própria no MiniStack (access key `111111111111`; no MiniStack, uma chave de 12 dígitos vira uma conta AWS isolada, com filas próprias). O app continua no banco `wagering` e na conta padrão. Por isso `docker compose up` e os testes rodam ao mesmo tempo, e o teste de migrations (que derruba e recria o schema) só mexe no banco de teste.
+>
+> Se o seu volume do Postgres foi criado **antes** dessa mudança, rode `docker compose down -v` uma vez para o banco de teste ser criado.
+>
+> O `bun run test:multi` para e religa o container do Postgres. Se o app estiver de pé, ele responde 503 por alguns segundos e volta sozinho.
 
 Todos os testes que movimentam saldo terminam conferindo o invariante **`saldo da wallet == saldo reconstruído pelo ledger`**.
 

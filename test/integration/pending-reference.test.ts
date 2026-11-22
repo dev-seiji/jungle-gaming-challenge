@@ -1,4 +1,4 @@
-// Integração real (Postgres do compose). O container `app` precisa estar parado: o worker dele disputaria as pendentes.
+// Integração real (Postgres do compose), no banco exclusivo dos testes: o worker do container `app` não enxerga estas pendentes.
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import { ProcessWagerTransaction } from '../../src/application/process-wager-transaction';
@@ -30,11 +30,6 @@ async function drainAt(now: Date, workers: ResolvePendingReference[] = [resolver
 }
 
 beforeAll(async () => {
-  const appRunning = await fetch('http://localhost:3000/health/live').then(
-    () => true,
-    () => false,
-  );
-  if (appRunning) throw new Error('stop the app container first: `docker compose stop app` (its worker would compete)');
   orm = await initOrm();
   const store = new PostgresWagerStore(orm);
   useCase = new ProcessWagerTransaction(store);

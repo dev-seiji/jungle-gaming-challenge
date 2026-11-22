@@ -638,6 +638,42 @@ No Docker: `docker compose up → app roda migration:up → sobe o Nest`. Valida
 
 ---
 
-## Pendências (fazer se sobrar tempo)
+## Extra — Banco e filas exclusivos dos testes (a pendência resolvida)
 
-- [ ] **Banco separado para os testes** (vale também para o consumidor SQS da Fase 6 e o worker de pendentes da Fase 7, que têm a mesma restrição) (ex.: `wagering_test` no mesmo Postgres). Hoje o container `app` usa o mesmo banco dos testes e precisa estar parado durante o `bun test` (`docker compose stop app`), senão o publisher dele disputa os eventos com o teste da outbox. Com um banco de teste, `docker compose up` e `bun test` rodariam juntos.
+### O que foi feito
+
+- **Banco `wagering_test`,** criado por `postgres/init/01-create-test-database.sql`. O Postgres executa essa pasta sozinho quando o volume é criado.
+- **Conta própria no MiniStack para os testes** (access key `111111111111`): no MiniStack, uma chave de 12 dígitos vira uma conta AWS isolada. O script de init cria as 3 filas nas duas contas, e antes de adotar testamos o isolamento na prática: a conta do app não enxerga as filas da conta de teste.
+- **O `.env.example` (só testes) aponta para o banco e a conta de teste.** O app no compose não mudou. **Nenhuma linha do código do app mudou.**
+- **Saíram as 4 travas** "pare o app primeiro" dos testes.
+
+### Prova
+
+- `docker compose down -v` + `up`: os 2 bancos e as 3 filas em cada conta foram criados.
+- `bun run test` rodou 2x **com o app de pé recebendo 20 apostas ao mesmo tempo**: 161 de 161 nas duas. O app terminou consistente (saldo == ledger), com 0 eventos pendentes.
+- `bun run test:multi` rodou 3x com o app de pé: 6 de 6. O app atravessou as 3 paradas do Postgres sozinho, sem reiniciar (`restarts=0`).
+
+### Decisões
+
+- **Isolar as filas pela conta do emulador,** e não por prefixo no nome da fila: assim o código do app não precisou de nenhuma configuração nova.
+- **Efeito bônus:** o teste de migrations (que derruba e recria o schema) agora só apaga o banco de teste, e não mais os dados de desenvolvimento.
+- **Volumes antigos:** quem já tinha o volume do Postgres precisa rodar `docker compose down -v` uma vez. O avaliador começa do zero, então para ele não muda nada.
+
+### Pergunta provável da banca
+
+- **"Seus testes rodam contra o mesmo banco da aplicação?"** Não. O banco é outro (`wagering_test`) e as filas estão em outra conta do emulador. A infraestrutura é real (o mesmo Postgres e o mesmo MiniStack do compose), mas os dados ficam isolados. Dá para rodar os testes com o app atendendo tráfego.
+
+### Arquivos
+
+- `postgres/init/01-create-test-database.sql`: cria o banco de teste.
+- `docker-compose.yml`: monta `postgres/init`.
+- `ministack/init/01-create-queues.sh`: cria as filas nas duas contas (a do app por último, para o healthcheck).
+- `.env.example`: banco e conta de teste.
+- `test/integration/helpers.ts` (`SQS_ACCOUNT`) e os testes de outbox, consumidor, pendências e várias instâncias, sem as travas.
+- `README.md`, `ARCHITECTURE.md`, `docs/PREPARACAO_BANCA.md`: atualizados.
+
+---
+
+## Pendências
+
+- [x] **Banco separado para os testes:** feito (seção anterior).

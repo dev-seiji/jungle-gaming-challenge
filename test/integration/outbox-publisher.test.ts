@@ -1,5 +1,5 @@
-// Integração real: Postgres + SQS (MiniStack) do compose. O container `app` precisa estar PARADO
-// (`docker compose stop app`): ele também roda um publisher sobre o mesmo banco e "roubaria" os eventos.
+// Integração real: Postgres + SQS (MiniStack) do compose, no banco e na conta SQS exclusivos dos testes
+// (ver .env.example), então o container `app` pode ficar de pé.
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { SendMessageCommand, SQSClient } from '@aws-sdk/client-sqs';
 import type { MikroORM } from '@mikro-orm/postgresql';
@@ -7,6 +7,7 @@ import { ProcessWagerTransaction } from '../../src/application/process-wager-tra
 import { EVENTS_QUEUE, OutboxPublisher } from '../../src/infrastructure/messaging/outbox-publisher';
 import { PostgresWagerStore } from '../../src/infrastructure/persistence/postgres-wager-store';
 import { command, createWallet, initOrm } from './helpers';
+import { SQS_ACCOUNT } from './helpers';
 
 let orm: MikroORM;
 let useCase: ProcessWagerTransaction;
@@ -35,7 +36,7 @@ async function outboxRows(walletId: string) {
 /** Mensagens que estão na fila de eventos agora (endpoint de inspeção do MiniStack, não consome). */
 async function queuedEventIds(): Promise<string[]> {
   const res = (await (await fetch(`${process.env.SQS_ENDPOINT}/_ministack/sqs/messages`)).json()) as any;
-  const queues = res.messages['000000000000']['us-east-1'] as Record<string, { Body: string }[]>;
+  const queues = res.messages[SQS_ACCOUNT]['us-east-1'] as Record<string, { Body: string }[]>;
   const events = Object.entries(queues).find(([url]) => url.endsWith(EVENTS_QUEUE))?.[1] ?? [];
   return events.map((m) => JSON.parse(m.Body).eventId as string);
 }
@@ -54,11 +55,6 @@ async function drain(publishers: OutboxPublisher[], until: () => Promise<boolean
 }
 
 beforeAll(async () => {
-  const appRunning = await fetch('http://localhost:3000/health/live').then(
-    () => true,
-    () => false,
-  );
-  if (appRunning) throw new Error('stop the app container first: `docker compose stop app` (it would compete for the outbox)');
   orm = await initOrm();
   useCase = new ProcessWagerTransaction(new PostgresWagerStore(orm));
 });

@@ -6,6 +6,9 @@ services:
       POSTGRES_PASSWORD: app
       POSTGRES_DB: wagering
     ports: ["5432:5432"]
+    volumes:
+      # Cria também o banco `wagering_test` (só roda quando o volume é novo).
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "app", "-d", "wagering"]
       interval: 2s

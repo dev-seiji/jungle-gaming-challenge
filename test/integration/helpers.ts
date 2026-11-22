@@ -99,3 +99,6 @@ export function command(
     ...overrides,
   };
 }
+
+/** Conta do MiniStack usada pelos testes: access key de 12 dígitos = conta isolada (ver .env.example). */
+export const SQS_ACCOUNT = /^\d{12}$/.test(process.env.AWS_ACCESS_KEY_ID ?? '') ? process.env.AWS_ACCESS_KEY_ID! : '000000000000';

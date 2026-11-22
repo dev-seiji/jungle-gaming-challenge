@@ -270,6 +270,7 @@ Vale 0 pontos no enunciado e ficou fora do escopo. O ponto de extensão existe: 
 - **Unidade:** `Money` (escala, entradas inválidas, precisão), `Wallet`, regras de cada tipo, transições, conflito de moeda, hash e payload divergente, outbox/backoff.
 - **Integração** (Postgres + MiniStack reais, sem mocks de banco ou fila): migrations up/down, cada constraint, concorrência real (cenário obrigatório, a mesma BET 50x, wallets em paralelo, wallet "quente"), API HTTP, outbox, consumidor (redelivery, worker morto antes do ack, retry, DLQ, SIGTERM), pendências e observabilidade.
 - **Várias instâncias** (`bun run test:multi`): 3 processos reais, `kill -9`, Postgres reiniciado, lock preso.
+- **Isolamento:** os testes usam um banco próprio (`wagering_test`) e uma conta própria no MiniStack (access key `111111111111`, com filas próprias). Assim o app pode ficar de pé enquanto os testes rodam, sem um disputar eventos ou mensagens do outro. Isso foi validado rodando a suíte com o app recebendo tráfego ao mesmo tempo.
 - **Todos os testes que movimentam saldo terminam conferindo `saldo == ledger`.**
 - **Testes de mutação manuais:** para os testes críticos, a proteção foi removida de propósito (lock, `SKIP LOCKED`, unique de reversão, regra de valor > 0, ack em erro transitório), confirmando que eles falham.
 
@@ -277,7 +278,6 @@ Vale 0 pontos no enunciado e ficou fora do escopo. O ponto de extensão existe: 
 
 ## 15. Trade-offs e limitações conhecidas
 
-- **Testes e app compartilham o banco e as filas:** o container `app` precisa estar parado durante `bun run test` e `bun run test:multi`. Melhoria planejada: um banco e filas exclusivos para testes.
 - **Migrations rodam na subida do app.** O migrator do MikroORM não usa lock (conferido no código da versão 7), então várias instâncias subindo **ao mesmo tempo** poderiam disputar a mesma migration, e a que perder falharia na subida. Hoje o compose tem uma instância só. Em produção: rodar as migrations como um job separado antes do deploy (ou usar um `pg_advisory_lock`).
 - **O publisher segura a transação durante o `SendMessage`** (lotes de 10, timeout de 5s por envio). É simples e correto. Para volume alto, a evolução seria "reservar" as linhas (lease) e publicar fora da transação.
 - **Eventos são at-least-once** (duplicata possível por desenho). Quem consome `wallet-events.fifo` precisa deduplicar por `eventId`. Esse consumidor está fora do escopo.
