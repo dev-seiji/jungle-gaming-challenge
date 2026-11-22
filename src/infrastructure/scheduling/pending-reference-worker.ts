@@ -1,5 +1,7 @@
 import { Logger } from '@nestjs/common';
 import type { ResolvePendingReference } from '../../application/resolve-pending-reference';
+import { WagerTransactionStatus } from '../../domain/wager-transaction';
+import { metrics, reportDecision } from '../observability/metrics';
 
 const IDLE_INTERVAL_MS = 1_000;
 
@@ -27,7 +29,16 @@ export class PendingReferenceWorker {
     while (this.running) {
       let found = false;
       try {
-        found = await this.resolve.runOnce();
+        const startedAt = performance.now();
+        const outcome = await this.resolve.runOnce();
+        found = outcome !== undefined;
+        if (outcome && outcome.result.status === WagerTransactionStatus.PendingReference) {
+          metrics.retries.inc({ component: 'pending_reference' }); // referência ainda ausente: nova tentativa agendada
+        } else if (outcome) {
+          reportDecision('pending_reference', outcome.transaction, outcome.result, startedAt, {
+            correlationId: outcome.transaction.id,
+          });
+        }
       } catch (error) {
         this.logger.error(`pending reference round failed: ${(error as Error).message}`);
       }

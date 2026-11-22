@@ -19,6 +19,7 @@ import {
 } from '../../domain/wager-transaction';
 import { Wallet } from '../../domain/wallet';
 import type { WalletLedgerEntry } from '../../domain/wallet-ledger-entry';
+import { metrics } from '../observability/metrics';
 import { InboxRecord, LedgerEntryRecord, OutboxRecord, WagerTransactionRecord, WalletRecord } from './records';
 
 // Esperar lock de uma wallet "quente" por mais que isso vira falha transitória (o cliente reenvia),
@@ -60,7 +61,16 @@ class PostgresUnitOfWork implements WagerUnitOfWork {
 
   async lockWallet(walletId: string): Promise<Wallet | undefined> {
     // Gera SELECT ... FOR UPDATE. Lock de LINHA: só essa wallet espera; as outras seguem em paralelo.
-    const record = await this.em.findOne(WalletRecord, { id: walletId }, { lockMode: LockMode.PESSIMISTIC_WRITE });
+    const startedAt = performance.now();
+    let record: WalletRecord | null;
+    try {
+      record = await this.em.findOne(WalletRecord, { id: walletId }, { lockMode: LockMode.PESSIMISTIC_WRITE });
+    } catch (error) {
+      if ((error as { code?: string }).code === '55P03') metrics.lockTimeouts.inc(); // estourou o lock_timeout
+      throw error;
+    } finally {
+      metrics.lockWait.observe((performance.now() - startedAt) / 1000);
+    }
     if (!record) return undefined;
     this.lockedWallets.set(walletId, record);
     return toWallet(record);

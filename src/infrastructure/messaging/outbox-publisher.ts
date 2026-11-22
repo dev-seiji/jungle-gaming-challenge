@@ -3,6 +3,7 @@ import { LockMode, type MikroORM } from '@mikro-orm/core';
 import type { EntityManager } from '@mikro-orm/postgresql';
 import { Logger } from '@nestjs/common';
 import { OutboxMessage } from '../../domain/outbox-message';
+import { metrics } from '../observability/metrics';
 import { OutboxRecord } from '../persistence/records';
 
 export const EVENTS_QUEUE = 'wallet-events.fifo';
@@ -55,7 +56,14 @@ export class OutboxPublisher {
         } catch (error) {
           // SQS fora do ar: o evento NÃO se perde — fica pendente e volta com backoff exponencial.
           message.scheduleRetry(new Date());
-          this.logger.warn(`publish failed for event ${message.id} (attempt ${message.attempts}): ${(error as Error).message}`);
+          metrics.retries.inc({ component: 'outbox_publisher' });
+          this.logger.warn({
+            msg: 'event publish failed, will retry',
+            eventId: message.id,
+            eventType: message.eventType,
+            attempts: message.attempts,
+            error: (error as Error).message,
+          });
         }
         // Unit of Work: as mudanças nos records viram UPDATE no flush do commit.
         record.attempts = message.attempts;

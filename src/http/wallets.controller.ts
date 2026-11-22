@@ -1,6 +1,7 @@
 import { Body, Controller, Get, Headers, HttpCode, Logger, NotFoundException, Param, Post, Query, UseGuards } from '@nestjs/common';
 import { CreateWallet } from '../application/create-wallet';
 import { InvalidInputError } from '../domain/errors';
+import { metrics } from '../infrastructure/observability/metrics';
 import { PostgresQueries } from '../infrastructure/persistence/postgres-queries';
 import { AuthGuard } from './auth.guard';
 
@@ -44,9 +45,9 @@ export class WalletsController {
     // Divergência NÃO é corrigida aqui: corrigir em silêncio esconderia o bug que a causou.
     // Fica logada (e em métrica, Fase 8) e sinalizada na resposta para investigação.
     if (!report.consistent) {
-      this.logger.warn(
-        `balance/ledger divergence on wallet ${walletId}: stored ${report.storedBalance.amount}, ledger ${report.calculatedBalance.amount}`,
-      );
+      metrics.reconciliationDivergences.inc();
+      // Sem valores no log (regra do projeto): o valor da divergência está na resposta, para quem tem acesso.
+      this.logger.warn({ msg: 'balance/ledger divergence', walletId, checkedEntries: report.checkedEntries });
     }
     return report;
   }

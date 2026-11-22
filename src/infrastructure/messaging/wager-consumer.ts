@@ -11,6 +11,7 @@ import { Logger } from '@nestjs/common';
 import type { ProcessWagerTransaction } from '../../application/process-wager-transaction';
 import { DuplicateMessageError, IdempotencyConflictError } from '../../application/wager-store';
 import { InvalidInputError } from '../../domain/errors';
+import { metrics, reportDecision } from '../observability/metrics';
 import type { PostgresQueries } from '../persistence/postgres-queries';
 import { isTransientDbError } from '../persistence/transient-errors';
 
@@ -88,21 +89,30 @@ export class WagerConsumer {
   async handle(message: Message): Promise<Outcome> {
     let outcome: Outcome;
     let reason = '';
+    let errorName = 'unknown';
     try {
       const envelope = parseEnvelope(message.Body);
       if (await this.queries.isMessageProcessed(CONSUMER_NAME, envelope.messageId)) {
+        metrics.duplicates.inc({ source: 'sqs' });
         outcome = 'ack'; // redelivery de algo já commitado (ex.: worker morreu antes do ack)
       } else {
-        await this.processWager.execute(envelope.command, {
+        const startedAt = performance.now();
+        const result = await this.processWager.execute(envelope.command, {
           correlationId: envelope.messageId,
           causationId: envelope.messageId,
           inbox: { consumerName: CONSUMER_NAME, messageId: envelope.messageId },
         });
+        reportDecision('sqs', envelope.command, result, startedAt, {
+          correlationId: envelope.messageId,
+          messageId: envelope.messageId,
+        });
         outcome = 'ack'; // execute só retorna depois do COMMIT
       }
     } catch (error) {
+      errorName = error instanceof Error ? error.name : 'unknown';
       reason = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
       if (error instanceof DuplicateMessageError) {
+        metrics.duplicates.inc({ source: 'sqs' });
         outcome = 'ack';
       } else if (
         error instanceof PermanentMessageError ||
@@ -113,10 +123,14 @@ export class WagerConsumer {
       } else {
         // Transitório (banco fora, lock_timeout) OU desconhecido: tenta de novo. Se for um bug que
         // sempre falha, o limite de entregas da fila leva a mensagem para a DLQ — nada se perde.
-        if (!isTransientDbError(error)) this.logger.error(`unexpected error, will retry: ${reason}`);
+        if (!isTransientDbError(error)) {
+          this.logger.error({ msg: 'unexpected error, will retry', messageId: message.MessageId, error: errorName });
+        }
         outcome = 'retry';
       }
     }
+    if (outcome === 'retry') metrics.retries.inc({ component: 'sqs_consumer' });
+    if (outcome === 'dead-letter') metrics.deadLetters.inc({ reason: errorName });
     await this.apply(message, outcome, reason);
     return outcome;
   }
@@ -139,7 +153,7 @@ export class WagerConsumer {
         }),
       );
       await this.sqs.send(new DeleteMessageCommand({ QueueUrl: urls.commands, ReceiptHandle: message.ReceiptHandle }));
-      this.logger.warn(`message ${message.MessageId} sent to DLQ: ${reason}`);
+      this.logger.warn({ msg: 'message sent to DLQ', messageId: message.MessageId, reason });
       return;
     }
     const receiveCount = Number(message.Attributes?.ApproximateReceiveCount ?? 1);

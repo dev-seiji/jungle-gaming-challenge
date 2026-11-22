@@ -15,12 +15,13 @@ import { PendingReferenceWorker } from './infrastructure/scheduling/pending-refe
 import { ResolvePendingReference } from './application/resolve-pending-reference';
 import { AuthGuard } from './http/auth.guard';
 import { HttpErrorFilter } from './http/http-error.filter';
+import { MetricsController } from './http/metrics.controller';
 import { WageringController } from './http/wagering.controller';
 import { WalletsController } from './http/wallets.controller';
 
 @Module({
   imports: [MikroOrmModule.forRoot(ormConfig)],
-  controllers: [HealthController, WalletsController, WageringController],
+  controllers: [HealthController, WalletsController, WageringController, MetricsController],
   providers: [
     // Credenciais e região vêm das variáveis AWS_* (cadeia padrão do SDK); o endpoint aponta para o MiniStack.
     { provide: SQSClient, useFactory: () => new SQSClient({ endpoint: process.env.SQS_ENDPOINT }) },

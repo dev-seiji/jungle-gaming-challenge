@@ -2,6 +2,7 @@ import { Body, Controller, Get, Headers, Param, Post, Res, UseGuards } from '@ne
 import { type ProcessWagerCommand, ProcessWagerTransaction } from '../application/process-wager-transaction';
 import { InvalidInputError } from '../domain/errors';
 import { WagerTransactionStatus } from '../domain/wager-transaction';
+import { reportDecision } from '../infrastructure/observability/metrics';
 import { PostgresQueries } from '../infrastructure/persistence/postgres-queries';
 import { AuthGuard } from './auth.guard';
 import { notFound } from './wallets.controller';
@@ -58,9 +59,11 @@ export class WageringController {
     @Headers('x-correlation-id') correlationId: string | undefined,
     @Res({ passthrough: true }) res: { status(code: number): unknown },
   ) {
-    const result = await this.processWager.execute(toCommand(body, idempotencyKey), {
-      correlationId: correlationId ?? Bun.randomUUIDv7(),
-    });
+    const startedAt = performance.now();
+    const command = toCommand(body, idempotencyKey);
+    const correlation = correlationId ?? Bun.randomUUIDv7();
+    const result = await this.processWager.execute(command, { correlationId: correlation });
+    reportDecision('http', command, result, startedAt, { correlationId: correlation });
     res.status(STATUS_BY_RESULT[result.status] ?? 500);
     return result;
   }

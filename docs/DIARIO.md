@@ -488,6 +488,70 @@ No Docker: `docker compose up → app roda migration:up → sobe o Nest`. Valida
 
 ---
 
+## Fase 8 — Observabilidade
+
+### O que foi feito
+
+- **Logs JSON estruturados:** uma linha por evento, com `correlationId`, `messageId`, `transactionId`, `walletId` e `providerId`. **Sem** valor, saldo ou corpo da requisição.
+- **Métricas Prometheus em `GET /metrics`** (biblioteca `prom-client`, aprovada pelo Gabriel):
+  - transações por status;
+  - duplicatas;
+  - retries;
+  - DLQ;
+  - espera e timeouts do lock da wallet;
+  - outbox lag;
+  - latência;
+  - divergências de reconciliação;
+  - métricas do processo (memória, CPU, event loop).
+- A medição fica **só nas bordas**: controller, consumidor, workers e adaptador do banco. O domínio e os casos de uso não mudaram, exceto o `runOnce` do worker, que passou a devolver o resultado.
+- 2 testes de integração, mais a conferência no Docker (linha de log real e `/metrics` real).
+
+### Fluxo
+
+`transação decidida (http / sqs / pending_reference) → reportDecision → contador por status + histograma de latência + UMA linha de log JSON`
+`GET /metrics → prom-client junta tudo → os gauges da outbox consultam o banco NA HORA (pendentes e idade do mais antigo)`
+
+### Conceitos novos
+
+- **Log estruturado.** Em vez de uma frase solta ("transação X processada"), o log é um objeto JSON com campos. Ferramentas como Loki, ELK e CloudWatch filtram por campo: "todas as linhas com `correlationId = abc`" mostra a história inteira de uma requisição.
+  *Analogia:* uma ficha preenchida, em vez de um bilhete escrito à mão.
+- **Correlation id.** Um id que acompanha uma operação por todos os lugares por onde ela passa (HTTP → evento → log). O cliente pode mandar no header `X-Correlation-Id`; se não mandar, geramos um. Na fila, usamos o `messageId`.
+- **Tipos de métrica.**
+  - **Contador:** só sobe (transações, retries, DLQ).
+  - **Gauge:** sobe e desce (eventos pendentes, lag).
+  - **Histograma:** distribuição de tempos (latência, espera do lock); permite calcular p50, p95 e p99 no Prometheus.
+- **Outbox lag.** A idade do evento mais antigo ainda não publicado. Se cresce, o publisher está parado ou o SQS está fora. É o alerta principal da Fase 5.
+- **Espera do lock como métrica de contenção.** O histograma `wallet_lock_wait_seconds` mostra quanto tempo as transações esperam na fila da wallet. Uma wallet "quente" aparece ali antes de virar timeout.
+
+### Decisões e alternativas descartadas
+
+- **`prom-client` em vez de escrever o formato à mão:** é a biblioteca padrão, faz histogramas, buckets e o formato correto, e traz métricas do processo de graça. Testamos no Bun antes de usar.
+- **Logger JSON próprio (~30 linhas), sem dependência:** o Nest permite trocar o logger. Todos os `new Logger(...)` do projeto passaram a sair em JSON sem mexer neles.
+- **Sem valores financeiros nos logs** (exigência do enunciado). O teste confere que a linha não contém o saldo, nem as palavras `amount` ou `balance`. A divergência de reconciliação loga só o `walletId`; o valor fica na resposta, para quem tem acesso à API.
+- **Labels com poucos valores possíveis** (source, kind, status, failure_code, component). **Nunca** ids como label: cada id viraria uma série nova, e o Prometheus explodiria em memória. Ids vão para os logs, não para as métricas.
+- **Os gauges da outbox são calculados no momento da coleta**, com uma consulta ao banco. Assim nunca ficam desatualizados, e funcionam com várias instâncias, porque a fonte é o banco.
+- **Correção — outbox lag negativo.** No Docker, o `/metrics` mostrou `outbox_lag_seconds = -3589`. A causa foram os testes do worker de pendentes, que simulam o relógio no futuro e geraram eventos com data à frente. Em produção, uma diferença de relógio entre instâncias faria o mesmo, em escala menor. Solução: `GREATEST(..., 0)` (o lag nunca é negativo).
+- **Duplicata conta em `wager_duplicates_total`, e não em `wager_transactions_total`:** um replay não é uma transação nova.
+
+### Perguntas prováveis da banca
+
+- **"Como você descobre por que uma transação foi rejeitada?"** Busco nos logs pelo `transactionId` ou pelo `correlationId`: a linha `transaction decided` traz o `status` e o `failureCode`. Também dá para consultar `GET /wagering/transactions/:id`.
+- **"Como saber se o publisher parou?"** Pelo `outbox_lag_seconds` crescendo (e pelo `outbox_pending_events`). Um alerta como "lag > 60s por 5 min" pegaria isso.
+- **"Como você mede conflito de lock?"** Pelo `wallet_lock_wait_seconds` (quanto se espera) e pelo `wallet_lock_timeouts_total` (quantas vezes a espera passou de 5s e virou erro transitório).
+- **"Por que não colocar o walletId como label da métrica?"** Porque cada wallet criaria uma série nova (alta cardinalidade), e o Prometheus ficaria lento e caro. Ids ficam nos logs; métricas ficam com dimensões de poucos valores.
+
+### Arquivos principais da fase
+
+- `src/infrastructure/observability/json-logger.ts`: logger JSON do Nest.
+- `src/infrastructure/observability/metrics.ts`: registro das métricas, gauges da outbox e `reportDecision` (métrica + log).
+- `src/http/metrics.controller.ts`: `GET /metrics`.
+- `src/main.ts`: liga o logger JSON.
+- Instrumentação: `wagering.controller.ts`, `wallets.controller.ts` (reconciliação), `wager-consumer.ts`, `outbox-publisher.ts`, `pending-reference-worker.ts`, `postgres-wager-store.ts` (lock).
+- `src/application/resolve-pending-reference.ts`: `runOnce` devolve o resultado (para o worker contar).
+- `test/integration/observability.test.ts`: métricas mudando com BET, replay e rejeição; log JSON sem valores.
+
+---
+
 ## Pendências (fazer se sobrar tempo)
 
 - [ ] **Banco separado para os testes** (vale também para o consumidor SQS da Fase 6 e o worker de pendentes da Fase 7, que têm a mesma restrição) (ex.: `wagering_test` no mesmo Postgres). Hoje o container `app` usa o mesmo banco dos testes e precisa estar parado durante o `bun test` (`docker compose stop app`), senão o publisher dele disputa os eventos com o teste da outbox. Com um banco de teste, `docker compose up` e `bun test` rodariam juntos.
