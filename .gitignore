@@ -137,3 +137,6 @@ dist
 
 # macOS
 .DS_Store
+
+# Contrato de trabalho com o Claude Code (local, não versionado)
+CLAUDE.md
