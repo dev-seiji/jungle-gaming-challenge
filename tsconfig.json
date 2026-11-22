@@ -1,0 +1,16 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["bun"],
+    // O NestJS descobre o que injetar lendo os tipos do construtor em tempo de execução;
+    // isso só funciona com decorators "legados" + emissão de metadados.
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true
+  },
+  "include": ["src", "scripts", "test"]
+}

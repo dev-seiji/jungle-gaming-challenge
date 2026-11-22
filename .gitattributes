@@ -1,2 +1,4 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+# Scripts rodam dentro de containers Linux: CRLF (checkout no Windows) quebraria o shell.
+*.sh text eol=lf
