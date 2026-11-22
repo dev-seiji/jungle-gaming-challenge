@@ -9,6 +9,7 @@ import { CreateWallet } from './application/create-wallet';
 import { ProcessWagerTransaction } from './application/process-wager-transaction';
 import { PostgresQueries } from './infrastructure/persistence/postgres-queries';
 import { PostgresWagerStore } from './infrastructure/persistence/postgres-wager-store';
+import { OutboxPublisher } from './infrastructure/messaging/outbox-publisher';
 import { AuthGuard } from './http/auth.guard';
 import { HttpErrorFilter } from './http/http-error.filter';
 import { WageringController } from './http/wagering.controller';
@@ -25,6 +26,11 @@ import { WalletsController } from './http/wallets.controller';
     { provide: PostgresQueries, useFactory: (orm: MikroORM) => new PostgresQueries(orm), inject: [MikroORM] },
     { provide: ProcessWagerTransaction, useFactory: (s: PostgresWagerStore) => new ProcessWagerTransaction(s), inject: [PostgresWagerStore] },
     { provide: CreateWallet, useFactory: (s: PostgresWagerStore) => new CreateWallet(s), inject: [PostgresWagerStore] },
+    {
+      provide: OutboxPublisher,
+      useFactory: (orm: MikroORM, sqs: SQSClient) => new OutboxPublisher(orm, sqs),
+      inject: [MikroORM, SQSClient],
+    },
     { provide: APP_FILTER, useClass: HttpErrorFilter },
     AuthGuard,
   ],

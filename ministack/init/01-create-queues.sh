@@ -21,4 +21,8 @@ sqs create-queue --queue-name wager-transactions.fifo --attributes "{
   \"RedrivePolicy\": \"{\\\"deadLetterTargetArn\\\":\\\"$DLQ_ARN\\\",\\\"maxReceiveCount\\\":\\\"5\\\"}\"
 }" > /dev/null
 
+# Fila de SAÍDA: eventos de integração publicados pela outbox. Separada da fila de entrada (comandos),
+# senão o serviço consumiria a própria saída.
+sqs create-queue --queue-name wallet-events.fifo --attributes FifoQueue=true > /dev/null
+
 echo "queues created"

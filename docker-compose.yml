@@ -23,8 +23,8 @@ services:
     volumes:
       - ./ministack/init:/etc/localstack/init/ready.d:ro
     healthcheck:
-      # "Saudável" só depois que o script de init criou a fila principal (a última a ser criada).
-      test: ["CMD", "aws", "--endpoint-url", "http://localhost:4566", "sqs", "get-queue-url", "--queue-name", "wager-transactions.fifo"]
+      # "Saudável" só depois que o script de init criou a última fila.
+      test: ["CMD", "aws", "--endpoint-url", "http://localhost:4566", "sqs", "get-queue-url", "--queue-name", "wallet-events.fifo"]
       interval: 2s
       timeout: 5s
       retries: 30

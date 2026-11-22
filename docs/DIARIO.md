@@ -315,4 +315,56 @@ No Docker: `docker compose up → app roda migration:up → sobe o Nest`. Valida
 - **Causa raiz:** no caminho **sem lock** (wallet não existe), o caso de uso fazia duas consultas seguidas: pela key e depois pelo id externo. No Postgres (nível READ COMMITTED), **cada SELECT enxerga os commits feitos até ele**. A cópia concorrente fazia commit entre as duas: a 1ª não achava nada, a 2ª achava, e o código concluía errado que era conflito. Antes o teste passava por sorte de tempo.
 - **Correção:** se a busca pelo id externo encontra a transação, comparo a key. Mesma key = mesma transação (replay, com checagem do hash); key diferente = conflito. Rodei o teste 8x isolado e a suíte inteira 3x, tudo verde.
 - **Lição para a banca:** sem lock, "consultar e depois decidir" é uma corrida. Com a wallet travada isso não acontece, porque tudo depois do lock é serializado. No caminho sem lock, a decisão precisa considerar que o mundo mudou entre uma consulta e outra, e a unique constraint continua como última barreira.
-- **Helper de testes:** tentamos trocar o helper que cria wallets pelo `CreateWallet` real. Ele funcionou, mas 2 testes contavam com a outbox vazia, e agora a abertura grava eventos (corretamente). Pela regra combinada com o Gabriel ("se quebrar, volta"), o helper voltou para o SQL direto.
+- **Helper de testes (decisão do Gabriel: "se quebrar, volta"):** tentamos trocar o helper que cria wallets pelo `CreateWallet` real. Ele funcionou, mas 2 testes contavam com a outbox vazia, e agora a abertura grava eventos (corretamente). Pela regra combinada com o Gabriel ("se quebrar, volta"), o helper voltou para o SQL direto.
+
+---
+
+## Fase 5 — Outbox publisher
+
+### O que foi feito
+
+- `OutboxPublisher`: um worker **dentro do app** (decisão do Gabriel) que, a cada ~500 ms, publica no SQS os eventos já commitados na outbox.
+- Ele é seguro com várias instâncias: cada rodada usa `SELECT ... FOR UPDATE SKIP LOCKED` (`LockMode.PESSIMISTIC_PARTIAL_WRITE` no MikroORM).
+- Se o SQS falha, o evento continua pendente e volta com backoff exponencial (a lógica do `OutboxMessage.scheduleRetry`, da Fase 1).
+- Criei a fila de saída `wallet-events.fifo`, separada da fila de entrada de comandos. O readiness agora checa as 3 filas.
+- O worker liga junto com o app e para com segurança no shutdown (termina a rodada atual antes de sair).
+- 4 testes de integração com Postgres e SQS reais.
+
+### Fluxo
+
+`a cada 500ms → BEGIN → SELECT até 10 eventos pendentes e vencidos FOR UPDATE SKIP LOCKED → para cada um: SendMessage (MessageGroupId = aggregateId, MessageDeduplicationId = eventId) → ok: published_at = agora / falhou: attempts + 1 e next_attempt_at = agora + backoff → COMMIT`
+
+### Conceitos novos
+
+- **Transactional Outbox.** O evento é gravado na **mesma transação** da mudança financeira (Fase 3) e só é publicado **depois** do commit, por este worker. Assim nunca existe "evento publicado de uma operação que deu rollback", nem "operação confirmada cujo evento se perdeu".
+  *Analogia:* o recibo é impresso junto com a venda e fica na gaveta. O entregador passa depois e leva todos os recibos que estão na gaveta. Se ele faltar um dia, os recibos continuam lá.
+- **`FOR UPDATE SKIP LOCKED`.** Trava as linhas que pegou e faz as outras instâncias **pularem** essas linhas, em vez de esperar. Cada publisher pega um lote diferente.
+  *Analogia:* vários caixas atendendo uma fila; cada cliente vai para um caixa só, e ninguém fica parado esperando o caixa do lado.
+- **At-least-once.** Se o processo morrer depois do `SendMessage` e antes do `COMMIT`, a linha volta a ficar pendente e o evento é publicado de novo. Duplicata é possível **por desenho**. O consumidor deduplica pelo `eventId` (que também é o id da mensagem). Entregar "exatamente uma vez" entre banco e fila não é possível sem uma transação distribuída.
+
+### Decisões e alternativas descartadas
+
+- **Worker dentro do app, e não num processo separado** (decisão do Gabriel): é mais simples e já escala com as instâncias, graças ao `SKIP LOCKED`. Um processo separado escalaria de forma independente, mas seria mais um serviço no compose.
+- **A transação SQL fica aberta durante o `SendMessage`.** É simples: o lock da linha garante que ninguém mais publica aquele evento enquanto ela está sendo enviada. O custo é segurar uma conexão por alguns milissegundos por lote. Limitamos o lote a 10 e o envio a um timeout de 5s. A alternativa, que é "reservar" a linha com uma coluna de lease e publicar fora da transação, aguenta mais volume, mas é mais complexa. Fica registrada como evolução.
+- **Fila de saída separada (`wallet-events.fifo`):** publicar eventos na fila de entrada faria o serviço consumir a própria saída.
+- **`MessageGroupId = aggregateId`:** mantém a ordem dos eventos de uma mesma wallet ou transação. **`MessageDeduplicationId = eventId`:** o SQS descarta duplicatas por 5 min. É só otimização; a garantia é o consumidor deduplicar pelo `eventId`.
+- **Sem limite de tentativas:** evento confirmado no banco não pode ser descartado (decisão da Fase 1). O backoff vai até 5 min entre tentativas.
+- **Lote cheio = segue direto, sem dormir:** se havia 10 eventos, provavelmente há mais esperando.
+- **Testes provam que testam:** tirando o `SKIP LOCKED`, dois publishers enviaram **60 mensagens para 30 eventos** (cada um duplicado). Com ele, 30 de 30, sem repetição.
+- **Restrição do ambiente de teste:** o container `app` também roda um publisher no mesmo banco. Durante o `bun test` ele precisa estar parado (`docker compose stop app`), senão disputa os eventos com os testes. O teste avisa com uma mensagem clara. Vai no README.
+
+### Perguntas prováveis da banca
+
+- **"O que acontece se o processo morrer depois do commit e antes de publicar?"** O evento está gravado na outbox, com `published_at` vazio. Qualquer instância (essa mesma depois de reiniciar, ou outra) o publica na próxima rodada. Teste: commit feito, nenhum publisher roda (a instância "morreu"), um publisher novo sobe e publica.
+- **"E se publicar e morrer antes de marcar como publicado?"** O evento sai de novo (at-least-once). É seguro porque o id é estável (`eventId`) e o consumidor deduplica. Exatamente-uma-vez entre Postgres e SQS exigiria uma transação distribuída, que nenhum dos dois oferece.
+- **"Como dois publishers não mandam o mesmo evento?"** Pelo `FOR UPDATE SKIP LOCKED`: a linha travada por um é invisível para o outro naquela rodada. Provado com 30 eventos e dois publishers (30 envios, nenhum repetido) e com o teste invertido (sem o lock: 60 envios).
+- **"E se o SQS ficar fora do ar por uma hora?"** Nada se perde: os eventos acumulam na outbox, com backoff de até 5 min entre tentativas, e saem quando o SQS voltar. A métrica de outbox lag (Fase 8) mostra o atraso.
+
+### Arquivos principais da fase
+
+- `src/infrastructure/messaging/outbox-publisher.ts`: o worker (rodada com SKIP LOCKED, envio, backoff, start/stop).
+- `src/app.module.ts`: registra o publisher (o Nest liga e desliga junto com o app).
+- `ministack/init/01-create-queues.sh`: cria a fila `wallet-events.fifo`.
+- `docker-compose.yml`: o healthcheck do MiniStack espera a última fila.
+- `src/health/health.controller.ts`: o readiness checa as 3 filas.
+- `test/integration/outbox-publisher.test.ts`: 4 testes (instância morta, dois publishers, SQS fora, loop em background).

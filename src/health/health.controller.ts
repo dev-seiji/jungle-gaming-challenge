@@ -2,7 +2,7 @@ import { Controller, Get, ServiceUnavailableException } from '@nestjs/common';
 import { MikroORM } from '@mikro-orm/core';
 import { GetQueueUrlCommand, SQSClient } from '@aws-sdk/client-sqs';
 
-const QUEUES = ['wager-transactions.fifo', 'wager-transactions-dlq.fifo'];
+const QUEUES = ['wager-transactions.fifo', 'wager-transactions-dlq.fifo', 'wallet-events.fifo'];
 // Health check precisa responder rápido: dependência travada conta como "fora", não como espera infinita.
 const TIMEOUT_MS = 2000;
 
