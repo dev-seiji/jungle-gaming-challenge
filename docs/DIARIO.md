@@ -186,3 +186,65 @@ No Docker: `docker compose up → app roda migration:up → sobe o Nest`. Valida
 - `src/database/migrations/Migration20261122000000_InitialSchema.ts`: cria e remove todo o schema, com as constraints comentadas.
 - `src/domain/failure-code.ts`: ganhou `WALLET_NOT_FOUND` e `WALLET_PLAYER_MISMATCH`.
 - `test/integration/schema.test.ts`: 25 testes de integração (migration up e down, mais cada constraint).
+
+---
+
+## Fase 3 — Caso de uso principal (o coração)
+
+### O que foi feito
+
+- Criei o `ProcessWagerTransaction`, o caso de uso que o HTTP (Fase 4) e a fila (Fase 6) vão chamar. Ele aplica BET, WIN, LOSS, REFUND e ROLLBACK, com idempotência e PENDING_REFERENCE.
+- Tudo numa transação SQL só: transação + saldo + ledger + eventos na outbox (+ inbox, quando vier da fila). Ou grava tudo, ou nada.
+- **Concorrência:** lock pessimista **por linha da wallet** (`SELECT ... FOR UPDATE`, via `LockMode.PESSIMISTIC_WRITE` do MikroORM).
+- **Persistência (opção C, decisão do Gabriel):** classes "record" só de banco, mapeadas por `EntitySchema`, mais um conversor record ↔ domínio. O caso de uso fala com uma **porta** (`WagerStore`), não com o MikroORM.
+- Uma 2ª migration guarda o **saldo observado** em cada transação (regra 7: o replay devolve o saldo daquele momento).
+- 20 testes de integração com paralelismo real, incluindo o cenário obrigatório e a mesma BET 50x.
+
+### Fluxo
+
+`valida entrada (formato, UUID, kind) → calcula payloadHash → BEGIN + SET LOCAL lock_timeout = 5s → [inbox, se veio da fila] → SELECT wallet FOR UPDATE (trava só ela) → busca idempotency key (depois do lock!) → existe? mesmo hash = replay / hash diferente = conflito → wallet existe? é do jogador? mesma moeda? → tem referência? não achou ou pendente = PENDING_REFERENCE / já revertida = ALREADY_REVERSED / inválida = código → LOSS? marca PROCESSED sem ledger → debit/credit (sem saldo = INSUFFICIENT_FUNDS ou REVERSAL_WOULD_OVERDRAW) → grava transação (flush) → UPDATE saldo + version → INSERT ledger → INSERT outbox → COMMIT → resposta`
+
+### Conceitos novos
+
+- **Lock pessimista (`SELECT ... FOR UPDATE`).** A primeira transação que lê a wallet "segura" a linha até o commit. As outras que querem a **mesma** wallet esperam na fila; wallets diferentes seguem em paralelo.
+  *Analogia:* o provador da loja. Uma pessoa por vez em cada provador, mas os outros provadores continuam funcionando.
+- **Lost update.** Duas transações leem saldo 100, cada uma debita 80 e grava 20. Uma escrita "some" e o dinheiro aparece do nada. **Provamos isso:** sem o lock, os testes falharam com `balance 30.00 != ledger 15.00`.
+- **Por que checar a idempotência DEPOIS do lock.** Se duas cópias da mesma requisição checassem antes, as duas veriam "não existe" e as duas processariam. Depois do lock, a segunda só passa quando a primeira já fez commit, então ela enxerga a primeira e vira replay.
+- **Unit of Work e Identity Map (MikroORM).** O `em` guarda as entidades carregadas (Identity Map) e rastreia as mudanças. No `flush`, gera os INSERT e UPDATE necessários (Unit of Work). Cada execução usa um `em.fork()` próprio, para nunca ver dados de outra requisição.
+- **Porta e adaptador.** O caso de uso depende de uma interface (`WagerStore`); o Postgres é só uma implementação. Isso permitiu o teste de atomicidade: um "store que falha antes do commit", sem mexer no caso de uso.
+- **`lock_timeout`.** Se uma wallet "quente" deixa alguém esperando mais de 5s, a espera vira erro transitório (503 na Fase 4, o cliente reenvia), em vez de prender conexões para sempre.
+
+### Decisões e alternativas descartadas
+
+- **Lock pessimista, e não otimista (`version` + retry).** Numa wallet muito disputada, o otimista faz quase todo mundo falhar e repetir. O pessimista põe todo mundo em fila e resolve de primeira. O custo é a espera, limitada pelo `lock_timeout`. A `version` continua sendo incrementada (pedido do enunciado) e serve de auditoria.
+- **Sem deadlock por construção:** cada transação trava **uma** linha (a wallet). Deadlock exige duas transações travando duas coisas em ordem inversa.
+- **Persistência opção C** (records + conversor), escolhida pelo Gabriel entre: (A) SQL explícito, que usaria pouco o ORM "preferencial"; (B) `EntitySchema` direto no domínio, de alto risco, porque o `Money` ocupa duas colunas e os campos são privados; (C) records, que usam Unit of Work, Identity Map e LockMode sem sujar o domínio. A rede de segurança de 30 min para voltar à (A) não foi necessária.
+- **Flush da transação antes do ledger.** O lançamento tem FK para a transação. Além disso, o flush antecipado faz a unique constraint de idempotência aparecer ali, e ela vira `DuplicateTransactionError` com uma repetição automática, que vira replay. Isso cobre o caso sem lock (`WALLET_NOT_FOUND`): 20 cópias em paralelo geram uma única linha.
+- **Defesa em camadas, observada no teste:** mesmo **sem** o lock, a "mesma BET 50x" continuou debitando uma vez só, porque a unique da idempotency key barrou as cópias. O lock protege o **saldo**; a constraint protege a **duplicata**.
+- **`isAlreadyReversed` checado com o lock da wallet** (a referência é da mesma wallet, então a checagem é confiável). O índice único da Fase 2 é a última barreira. O teste "10 REFUNDs concorrentes" resulta em 1 PROCESSED e 9 ALREADY_REVERSED.
+- **Referência existente, mas ainda pendente, vira PENDING_REFERENCE** (não rejeição). Isso fecha o ponto em aberto da Fase 1.
+- **Saldo observado guardado na transação** (2ª migration, colunas `observed_balance_*`). A moeda tem coluna própria porque, em `CURRENCY_MISMATCH`, o saldo está na moeda da wallet.
+- **Validação de `walletId` como UUID no caso de uso:** sem ela, um id malformado viraria erro de SQL (500) em vez de entrada inválida (400).
+- **Snapshot do MikroORM desligado** (`snapshot: false`). Ele só serve para gerar migrations automaticamente, e as nossas são escritas à mão.
+- **Testes:**
+  - Eles provam que testam: tirando o lock, 4 testes falham com lost update.
+  - Achei e corrigi no próprio teste um `expect(...).rejects` sem `await`, que passaria sem verificar nada.
+  - Todos terminam conferindo `saldo == ledger`.
+
+### Perguntas prováveis da banca
+
+- **"Como você garante que duas apostas simultâneas não deixam o saldo negativo?"** O `SELECT ... FOR UPDATE` coloca as transações da mesma wallet em fila: a segunda só lê o saldo depois do commit da primeira, e aí vê 20 e rejeita. E se mesmo assim algo escapasse, o `CHECK (balance >= 0)` do banco recusaria. Teste: 30 apostas de 7.00 em paralelo num saldo de 100 resultam em exatamente 14 processadas e saldo 2.00.
+- **"E com várias instâncias da aplicação?"** O lock é do **Postgres**, não da memória do processo. Todas as instâncias usam o mesmo banco, então a fila por wallet vale entre processos. Teste com 3+ processos na Fase 9.
+- **"O que acontece se o processo morrer no meio?"** Antes do commit, o Postgres desfaz tudo (rollback), e há teste simulando a falha: nada fica gravado, nem transação, nem saldo, nem ledger, nem outbox, nem inbox. Depois do commit, tudo está gravado junto, inclusive o evento na outbox, que será publicado depois (Fase 5).
+- **"Por que não usar lock otimista, que o enunciado sugere com o `version`?"** Numa hot wallet, o otimista vira uma tempestade de retries. O enunciado aceita outra estratégia, desde que justificada. A `version` continua lá e incrementa só quando o saldo muda.
+
+### Arquivos principais da fase
+
+- `src/application/process-wager-transaction.ts`: o caso de uso, com a ordem das checagens comentada.
+- `src/application/wager-store.ts`: a porta (interfaces) e os erros de aplicação (duplicata, conflito de idempotência).
+- `src/infrastructure/persistence/records.ts`: classes de banco + `EntitySchema`.
+- `src/infrastructure/persistence/postgres-wager-store.ts`: adaptador MikroORM (fork, transactional, LockMode, flush, conversão).
+- `src/database/migrations/Migration20261122010000_ObservedBalance.ts`: colunas do saldo observado.
+- `src/mikro-orm.config.ts`: registra os schemas e desliga o snapshot.
+- `test/integration/helpers.ts`: cria wallets com lançamento de abertura e confere o invariante `saldo == ledger`.
+- `test/integration/process-wager-transaction.test.ts`: 20 testes (concorrência, idempotência, regras, atomicidade).
