@@ -368,3 +368,9 @@ No Docker: `docker compose up → app roda migration:up → sobe o Nest`. Valida
 - `docker-compose.yml`: o healthcheck do MiniStack espera a última fila.
 - `src/health/health.controller.ts`: o readiness checa as 3 filas.
 - `test/integration/outbox-publisher.test.ts`: 4 testes (instância morta, dois publishers, SQS fora, loop em background).
+
+---
+
+## Pendências (fazer se sobrar tempo)
+
+- [ ] **Banco separado para os testes** (ex.: `wagering_test` no mesmo Postgres). Hoje o container `app` usa o mesmo banco dos testes e precisa estar parado durante o `bun test` (`docker compose stop app`), senão o publisher dele disputa os eventos com o teste da outbox. Com um banco de teste, `docker compose up` e `bun test` rodariam juntos.
