@@ -1,6 +1,10 @@
 // Códigos estáveis e legíveis por máquina: o provedor decide por eles se reenvia, corrige ou desiste.
 // Todos são rejeições de negócio (terminais): reenviar o mesmo payload dá o mesmo resultado.
 export enum FailureCode {
+  /** walletId não existe. Gravada como REJECTED: reenvio com a mesma key devolve a mesma rejeição. */
+  WalletNotFound = 'WALLET_NOT_FOUND',
+  /** A wallet existe mas é de outro jogador: bug ou fraude no provedor. */
+  WalletPlayerMismatch = 'WALLET_PLAYER_MISMATCH',
   /** BET maior que o saldo. Provedor pode tentar outra aposta menor. */
   InsufficientFunds = 'INSUFFICIENT_FUNDS',
   /** ROLLBACK de WIN/REFUND deixaria o saldo negativo (o jogador já gastou o crédito). */

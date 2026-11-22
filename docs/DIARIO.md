@@ -125,3 +125,64 @@ Se faltar saldo: `wallet.debit lança InsufficientBalanceError → tx.reject(tx.
 - `src/domain/events.ts`: envelope abstrato + 4 eventos de integração.
 - `src/domain/inbox-message.ts` / `outbox-message.ts`: deduplicação de entrada e publicação com backoff.
 - `test/unit/*.test.ts`: 74 testes unitários.
+
+---
+
+## Fase 2 — Schema e migrations
+
+### O que foi feito
+
+- Uma migration escrita à mão em SQL cria as 5 tabelas: `wallets`, `wager_transactions`, `wallet_ledger_entries`, `inbox_messages` e `outbox_messages`. O `down` remove tudo.
+- As garantias do enunciado (unicidade, saldo nunca negativo, ledger imutável) estão **no banco**, por constraints e trigger. Valem mesmo se o código da aplicação tiver bug.
+- Entraram dois códigos de falha novos: `WALLET_NOT_FOUND` e `WALLET_PLAYER_MISMATCH`.
+- 25 testes de integração contra o Postgres real. Cada um tenta violar uma regra e confere que o banco recusa, com o código de erro e o nome da constraint.
+
+### Fluxo
+
+`bun run migration:up → MikroORM lê src/database/migrations → aplica as que faltam (em transação) → registra em mikro_orm_migrations`
+
+No Docker: `docker compose up → app roda migration:up → sobe o Nest`. Validado subindo do zero, com o volume apagado.
+
+### Conceitos novos
+
+- **Constraint.** Uma regra que o próprio banco garante. Se alguém tentar gravar algo que a viola, o banco recusa a operação inteira.
+  *Analogia:* a catraca do metrô. Não importa o que você diga ao segurança: sem bilhete, ela não gira.
+- **Unique parcial** (`CREATE UNIQUE INDEX ... WHERE ...`). A unicidade vale só para as linhas que atendem a condição. Usamos para "uma referência só pode ser revertida uma vez", contando apenas REFUND e ROLLBACK.
+- **FK composta** (`(wallet_id, currency) → wallets(id, currency)`). O lançamento só existe se houver uma wallet com aquele id **e** aquela moeda. Assim, o banco impede um lançamento em USD numa wallet BRL.
+- **Trigger.** Uma função que o banco executa sozinho antes ou depois de uma operação. O nosso trigger recusa UPDATE, DELETE e TRUNCATE no ledger.
+  *Analogia:* livro-caixa escrito a caneta. Errou, faz um lançamento de estorno, não apaga.
+- **SQLSTATE.** O código padrão de erro do Postgres: `23505` para unique, `23514` para check, `23503` para FK e `P0001` para erro lançado por função. Os testes conferem o código exato.
+
+### Decisões e alternativas descartadas
+
+- **Migration escrita à mão, não gerada pelo ORM.** O gerador do MikroORM cria tabelas a partir das entidades, mas não sabe fazer CHECK com regra de negócio, unique parcial nem trigger. E é isso que o enunciado avalia.
+- **Reversão única por referência, de qualquer tipo** (decisão do Gabriel, opção A). O enunciado proíbe reverter duas vezes "pelo mesmo tipo". Ao pé da letra, uma BET poderia receber REFUND **e** ROLLBACK, creditando duas vezes. Nosso índice `UNIQUE (reference_transaction_id) WHERE kind IN ('REFUND','ROLLBACK')` é mais rígido e continua cumprindo a regra 4. Fazer ROLLBACK de um REFUND continua permitido, porque a referência é outra.
+- **Transação para wallet inexistente é gravada como REJECTED `WALLET_NOT_FOUND`** (decisão do Gabriel, opção 2). A primeira proposta era rejeitar sem gravar, e foi descartada por três motivos:
+  1. Um reenvio depois que a wallet fosse criada seria processado: a mesma requisição teria dois resultados, o que contraria a regra 7.
+  2. HTTP e fila se comportariam diferente, porque o inbox da fila grava a mensagem como vista e o HTTP não gravaria nada.
+  3. Não ficaria rastro para auditoria.
+
+  Custo: `wager_transactions.wallet_id` não tem FK. Não abre buraco, porque dinheiro só se move pelo ledger, e o ledger tem FK para a wallet.
+- **`WALLET_PLAYER_MISMATCH`**: a wallet existe, mas pertence a outro jogador. É rejeição definitiva e tem código próprio, porque indica bug ou fraude no provedor.
+- **O banco confere a aritmética do ledger** (`ledger_balanced`). A classe `WalletLedgerEntry` já confere, mas a regra fica também no banco, como segunda camada.
+- **Coerência entre status e campos** (REJECTED exige `failure_code`, PROCESSED exige `processed_at`). Impede gravar um estado "meio preenchido".
+- **Tipos:** ids internos são `uuid`; ids externos (player, provider, round, game, message) são `text`, porque o formato é do provedor. Dinheiro é `numeric(20,2)` + `char(3)`. O payload da outbox é `jsonb`.
+- **Índices pensados para as consultas das próximas fases:** `(wallet_id, id)` para o extrato paginado por cursor, e `outbox_pending_idx` parcial para o publisher, que só lê pendentes.
+- **As colunas do worker de PENDING_REFERENCE (`attempts`, `next_attempt_at`) ficaram para uma 2ª migration, na Fase 7.** Isso mostra na prática o versionamento.
+- **Testes provam que testam:** removemos de propósito o `UNIQUE` do índice de reversão e os 2 testes de reversão falharam. Depois restauramos.
+- **Limitações conhecidas:**
+  - O teste de migration derruba e recria o schema, apagando os dados do banco de desenvolvimento.
+  - Um superusuário do Postgres consegue desligar triggers. Em produção, o app rodaria com um usuário sem permissão de alterar tabelas.
+
+### Perguntas prováveis da banca
+
+- **"Se o código já valida, por que repetir no banco?"** Com várias instâncias e vários caminhos de escrita (HTTP, fila, worker), basta um bug ou uma corrida entre processos para o código deixar passar. O banco é o único ponto que **todas** as instâncias compartilham, então é lá que a garantia é absoluta. O enunciado exige isso explicitamente (restrição 9).
+- **"Como você impede que alguém apague um lançamento do ledger?"** Com um trigger que recusa UPDATE, DELETE e TRUNCATE, com teste provando os três. Correções viram **novos** lançamentos (ROLLBACK), nunca edição.
+- **"Por que a tabela de transações não tem FK para wallets?"** Porque queremos gravar a rejeição `WALLET_NOT_FOUND` para manter a idempotência: todo reenvio devolve a mesma resposta. A segurança financeira não depende dessa FK, porque o ledger tem FK para a wallet e nenhum dinheiro se move sem lançamento.
+- **"Um provedor pode fazer REFUND e depois ROLLBACK da mesma aposta?"** Não. O índice único parcial permite uma reversão por referência, e há teste provando que o ROLLBACK depois do REFUND é recusado pelo banco.
+
+### Arquivos principais da fase
+
+- `src/database/migrations/Migration20261122000000_InitialSchema.ts`: cria e remove todo o schema, com as constraints comentadas.
+- `src/domain/failure-code.ts`: ganhou `WALLET_NOT_FOUND` e `WALLET_PLAYER_MISMATCH`.
+- `test/integration/schema.test.ts`: 25 testes de integração (migration up e down, mais cada constraint).
