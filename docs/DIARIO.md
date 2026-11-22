@@ -308,3 +308,11 @@ No Docker: `docker compose up → app roda migration:up → sobe o Nest`. Valida
 - `src/http/auth.guard.ts`: o ponto de extensão da autenticação.
 - `src/app.module.ts`: monta tudo.
 - `test/integration/http.test.ts`: 18 testes pela HTTP real.
+
+### Correção depois da Fase 4: corrida entre duas consultas (bug da Fase 3)
+
+- **Sintoma:** o teste "mesma transação para wallet inexistente, 20x em paralelo" passou a falhar sempre, com `IdempotencyConflictError` ("externalTransactionId já usado com outra key"), mas a key era a mesma.
+- **Causa raiz:** no caminho **sem lock** (wallet não existe), o caso de uso fazia duas consultas seguidas: pela key e depois pelo id externo. No Postgres (nível READ COMMITTED), **cada SELECT enxerga os commits feitos até ele**. A cópia concorrente fazia commit entre as duas: a 1ª não achava nada, a 2ª achava, e o código concluía errado que era conflito. Antes o teste passava por sorte de tempo.
+- **Correção:** se a busca pelo id externo encontra a transação, comparo a key. Mesma key = mesma transação (replay, com checagem do hash); key diferente = conflito. Rodei o teste 8x isolado e a suíte inteira 3x, tudo verde.
+- **Lição para a banca:** sem lock, "consultar e depois decidir" é uma corrida. Com a wallet travada isso não acontece, porque tudo depois do lock é serializado. No caminho sem lock, a decisão precisa considerar que o mundo mudou entre uma consulta e outra, e a unique constraint continua como última barreira.
+- **Helper de testes:** tentamos trocar o helper que cria wallets pelo `CreateWallet` real. Ele funcionou, mas 2 testes contavam com a outbox vazia, e agora a abertura grava eventos (corretamente). Pela regra combinada com o Gabriel ("se quebrar, volta"), o helper voltou para o SQL direto.

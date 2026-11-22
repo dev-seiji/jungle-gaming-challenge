@@ -60,9 +60,9 @@ class PostgresUnitOfWork implements WagerUnitOfWork {
     return record ? toStored(record) : undefined;
   }
 
-  async findByExternalId(providerId: string, externalTransactionId: string): Promise<WagerTransaction | undefined> {
+  async findByExternalId(providerId: string, externalTransactionId: string): Promise<StoredTransaction | undefined> {
     const record = await this.em.findOne(WagerTransactionRecord, { providerId, externalTransactionId });
-    return record ? toTransaction(record) : undefined;
+    return record ? toStored(record) : undefined;
   }
 
   async isAlreadyReversed(referenceTransactionId: string): Promise<boolean> {

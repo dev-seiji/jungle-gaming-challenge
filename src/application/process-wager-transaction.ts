@@ -119,17 +119,22 @@ export class ProcessWagerTransaction {
     const wallet = await uow.lockWallet(tx.walletId);
 
     // 2) Idempotência, checada DEPOIS do lock (antes dele, duas cópias concorrentes não veriam uma à outra).
-    const existing = await uow.findByIdempotencyKey(tx.idempotencyKey);
+    //    Busca pela key OU pelo id externo. Sem lock (wallet inexistente), uma cópia concorrente pode fazer
+    //    commit ENTRE as duas consultas (cada SELECT vê os commits feitos até ele): por isso, achar pelo id
+    //    externo com a MESMA key ainda é a mesma transação (replay); só key diferente é conflito.
+    const existing =
+      (await uow.findByIdempotencyKey(tx.idempotencyKey)) ??
+      (await uow.findByExternalId(tx.providerId, tx.externalTransactionId));
     if (existing) {
+      if (existing.transaction.idempotencyKey !== tx.idempotencyKey) {
+        throw new IdempotencyConflictError(
+          `externalTransactionId ${tx.externalTransactionId} was already used with another idempotency key`,
+        );
+      }
       if (!existing.transaction.matchesPayload(tx.payloadHash)) {
         throw new IdempotencyConflictError(`idempotency key ${tx.idempotencyKey} was used with a different payload`);
       }
       return replay(existing);
-    }
-    if (await uow.findByExternalId(tx.providerId, tx.externalTransactionId)) {
-      throw new IdempotencyConflictError(
-        `externalTransactionId ${tx.externalTransactionId} was already used with another idempotency key`,
-      );
     }
 
     // 3) Regras que não dependem de saldo.
@@ -139,7 +144,7 @@ export class ProcessWagerTransaction {
 
     let reference: WagerTransaction | undefined;
     if (tx.referenceExternalTransactionId) {
-      reference = await uow.findByExternalId(tx.providerId, tx.referenceExternalTransactionId);
+      reference = (await uow.findByExternalId(tx.providerId, tx.referenceExternalTransactionId))?.transaction;
       // Referência ainda não chegou (ou chegou e ainda não foi decidida): espera, não rejeita (regra 8).
       if (!reference || !reference.isTerminal()) {
         tx.markPendingReference();

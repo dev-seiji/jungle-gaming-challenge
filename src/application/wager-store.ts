@@ -19,7 +19,7 @@ export interface WagerUnitOfWork {
   /** SELECT ... FOR UPDATE: segura a wallet até o commit. Outras wallets não são afetadas. */
   lockWallet(walletId: string): Promise<Wallet | undefined>;
   findByIdempotencyKey(idempotencyKey: string): Promise<StoredTransaction | undefined>;
-  findByExternalId(providerId: string, externalTransactionId: string): Promise<WagerTransaction | undefined>;
+  findByExternalId(providerId: string, externalTransactionId: string): Promise<StoredTransaction | undefined>;
   /** A referência já tem uma reversão (REFUND/ROLLBACK) aplicada? */
   isAlreadyReversed(referenceTransactionId: string): Promise<boolean>;
 
