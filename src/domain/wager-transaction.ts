@@ -47,12 +47,20 @@ export interface WagerTransactionState {
   referenceTransactionId?: string;
   failureCode?: FailureCode;
   processedAt?: Date;
+  referenceAttempts?: number;
+  nextReferenceAttemptAt?: Date;
 }
 
 export type CreateWagerTransactionProps = Omit<
   WagerTransactionState,
-  'id' | 'status' | 'referenceTransactionId' | 'failureCode' | 'processedAt'
+  'id' | 'status' | 'referenceTransactionId' | 'failureCode' | 'processedAt' | 'referenceAttempts' | 'nextReferenceAttemptAt'
 >;
+
+// Reprocessamento de PENDING_REFERENCE: espera 5s, 10s, 20s ... 640s entre as tentativas (8 no total, ~21 min).
+// Referência fora de ordem costuma chegar em segundos; 21 min cobre até um lote atrasado do provedor.
+// Depois disso o provedor precisa de resposta definitiva (REFERENCE_NOT_FOUND), não de algo pendurado.
+export const MAX_REFERENCE_ATTEMPTS = 8;
+const REFERENCE_RETRY_BASE_MS = 5_000;
 
 export class WagerTransaction {
   private constructor(
@@ -74,6 +82,8 @@ export class WagerTransaction {
     private _referenceTransactionId?: string,
     private _failureCode?: FailureCode,
     private _processedAt?: Date,
+    private _referenceAttempts = 0,
+    private _nextReferenceAttemptAt?: Date,
   ) {}
 
   /** Nasce em PENDING. Valida o que vem do provedor (API ou fila). */
@@ -148,6 +158,8 @@ export class WagerTransaction {
       s.referenceTransactionId,
       s.failureCode,
       s.processedAt,
+      s.referenceAttempts ?? 0,
+      s.nextReferenceAttemptAt,
     );
   }
 
@@ -163,6 +175,12 @@ export class WagerTransaction {
   get processedAt(): Date | undefined {
     return this._processedAt;
   }
+  get referenceAttempts(): number {
+    return this._referenceAttempts;
+  }
+  get nextReferenceAttemptAt(): Date | undefined {
+    return this._nextReferenceAttemptAt;
+  }
 
   // ---- transições
   // PENDING → PROCESSED | REJECTED | FAILED | PENDING_REFERENCE
@@ -176,11 +194,28 @@ export class WagerTransaction {
     this._processedAt = at;
   }
 
-  markPendingReference(): void {
+  /** Referência ainda não chegou: espera e agenda a 1ª nova tentativa do worker. */
+  markPendingReference(now: Date): void {
     if (this._status !== WagerTransactionStatus.Pending) {
       throw new InvalidTransactionStateError(`markPendingReference not allowed from ${this._status}`);
     }
     this._status = WagerTransactionStatus.PendingReference;
+    this._referenceAttempts = 0;
+    this._nextReferenceAttemptAt = new Date(now.getTime() + REFERENCE_RETRY_BASE_MS);
+  }
+
+  /**
+   * O worker tentou de novo e a referência continua ausente. Agenda a próxima com backoff exponencial
+   * ou devolve 'exhausted' quando acabaram as tentativas (aí o caller rejeita com REFERENCE_NOT_FOUND).
+   */
+  registerFailedReferenceAttempt(now: Date): 'retry' | 'exhausted' {
+    if (this._status !== WagerTransactionStatus.PendingReference) {
+      throw new InvalidTransactionStateError(`registerFailedReferenceAttempt not allowed from ${this._status}`);
+    }
+    this._referenceAttempts += 1;
+    if (this._referenceAttempts >= MAX_REFERENCE_ATTEMPTS) return 'exhausted';
+    this._nextReferenceAttemptAt = new Date(now.getTime() + REFERENCE_RETRY_BASE_MS * 2 ** this._referenceAttempts);
+    return 'retry';
   }
 
   reject(code: FailureCode): void {

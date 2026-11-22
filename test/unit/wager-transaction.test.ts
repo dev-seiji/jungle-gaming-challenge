@@ -69,7 +69,7 @@ describe('WagerTransaction.create', () => {
 describe('state transitions', () => {
   test('PENDING → PENDING_REFERENCE → PROCESSED', () => {
     const t = tx({ kind: Kind.Refund, referenceExternalTransactionId: 'bet-1' });
-    t.markPendingReference();
+    t.markPendingReference(at);
     expect(t.status).toBe(Status.PendingReference);
     t.markProcessed('ref-internal-id', at);
     expect(t.status).toBe(Status.Processed);
@@ -79,7 +79,7 @@ describe('state transitions', () => {
 
   test('PENDING_REFERENCE → REJECTED with REFERENCE_NOT_FOUND', () => {
     const t = tx({ kind: Kind.Refund, referenceExternalTransactionId: 'bet-1' });
-    t.markPendingReference();
+    t.markPendingReference(at);
     t.reject(FailureCode.ReferenceNotFound);
     expect(t.status).toBe(Status.Rejected);
     expect(t.failureCode).toBe(FailureCode.ReferenceNotFound);
@@ -87,8 +87,8 @@ describe('state transitions', () => {
 
   test('cannot go to PENDING_REFERENCE twice', () => {
     const t = tx();
-    t.markPendingReference();
-    expect(() => t.markPendingReference()).toThrow(InvalidTransactionStateError);
+    t.markPendingReference(at);
+    expect(() => t.markPendingReference(at)).toThrow(InvalidTransactionStateError);
   });
 
   test.each([
@@ -102,7 +102,7 @@ describe('state transitions', () => {
     expect(() => t.markProcessed(undefined, at)).toThrow(InvalidTransactionStateError);
     expect(() => t.reject(FailureCode.AmountMismatch)).toThrow(InvalidTransactionStateError);
     expect(() => t.fail(FailureCode.AmountMismatch)).toThrow(InvalidTransactionStateError);
-    expect(() => t.markPendingReference()).toThrow(InvalidTransactionStateError);
+    expect(() => t.markPendingReference(at)).toThrow(InvalidTransactionStateError);
   });
 
   test('rehydrate does not revalidate: rebuilds a terminal state as it was stored', () => {
@@ -225,5 +225,25 @@ describe('idempotency: payload hash', () => {
 
   test('hash is SHA-256 hex', () => {
     expect(payloadHash(fields)).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
+
+describe('PENDING_REFERENCE retry schedule', () => {
+  test('waits 5s, 10s, 20s ... 640s between attempts and is exhausted at the 8th failure (~21 min)', () => {
+    const t = tx({ kind: Kind.Refund, referenceExternalTransactionId: 'bet-1' });
+    t.markPendingReference(at);
+    const delays = [t.nextReferenceAttemptAt!.getTime() - at.getTime()];
+    const outcomes: string[] = [];
+    for (let i = 0; i < 8; i++) {
+      outcomes.push(t.registerFailedReferenceAttempt(at));
+      if (outcomes.at(-1) === 'retry') delays.push(t.nextReferenceAttemptAt!.getTime() - at.getTime());
+    }
+    expect(delays).toEqual([5, 10, 20, 40, 80, 160, 320, 640].map((s) => s * 1000));
+    expect(outcomes).toEqual([...Array(7).fill('retry'), 'exhausted']);
+    expect(delays.reduce((a, b) => a + b, 0) / 60_000).toBeCloseTo(21.25, 2);
+  });
+
+  test('only a PENDING_REFERENCE transaction can register a failed attempt', () => {
+    expect(() => tx().registerFailedReferenceAttempt(at)).toThrow(InvalidTransactionStateError);
   });
 });

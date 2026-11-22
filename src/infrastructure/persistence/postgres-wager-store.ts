@@ -54,6 +54,7 @@ export class PostgresWagerStore implements WagerStore {
 class PostgresUnitOfWork implements WagerUnitOfWork {
   // Records das wallets travadas: o Unit of Work rastreia mudanças neles e gera o UPDATE no flush.
   private readonly lockedWallets = new Map<string, WalletRecord>();
+  private readonly claimedTransactions = new Map<string, WagerTransactionRecord>();
 
   constructor(private readonly em: EntityManager) {}
 
@@ -120,6 +121,26 @@ class PostgresUnitOfWork implements WagerUnitOfWork {
       }
       throw error;
     }
+  }
+
+  async claimDuePendingReference(now: Date): Promise<WagerTransaction | undefined> {
+    // SKIP LOCKED: outra instância do worker pula esta linha em vez de esperar — cada pendente é
+    // reprocessada por um worker só de cada vez.
+    const [record] = await this.em.find(
+      WagerTransactionRecord,
+      { status: 'PENDING_REFERENCE', nextReferenceAttemptAt: { $lte: now } },
+      { orderBy: { nextReferenceAttemptAt: 'asc' }, limit: 1, lockMode: LockMode.PESSIMISTIC_PARTIAL_WRITE },
+    );
+    if (!record) return undefined;
+    this.claimedTransactions.set(record.id, record);
+    return toTransaction(record);
+  }
+
+  updateTransaction(transaction: WagerTransaction, observedBalance?: Money): void {
+    const record = this.claimedTransactions.get(transaction.id);
+    if (!record) throw new Error(`transaction ${transaction.id} must be claimed before being updated`);
+    // Unit of Work: alterar o record gerenciado vira UPDATE no flush do commit.
+    copyTransaction(record, transaction, observedBalance);
   }
 
   saveWallet(wallet: Wallet): void {
@@ -207,6 +228,8 @@ function toTransaction(r: WagerTransactionRecord): WagerTransaction {
     referenceTransactionId: r.referenceTransactionId ?? undefined,
     failureCode: (r.failureCode ?? undefined) as FailureCode | undefined,
     processedAt: r.processedAt ?? undefined,
+    referenceAttempts: r.referenceAttempts,
+    nextReferenceAttemptAt: r.nextReferenceAttemptAt ?? undefined,
   });
 }
 
@@ -219,7 +242,12 @@ function toStored(r: WagerTransactionRecord): StoredTransaction {
 }
 
 function toTransactionRecord(t: WagerTransaction, observedBalance?: Money): WagerTransactionRecord {
-  return Object.assign(new WagerTransactionRecord(), {
+  return copyTransaction(new WagerTransactionRecord(), t, observedBalance);
+}
+
+/** Copia o estado do domínio para o record (novo ou já gerenciado pelo Unit of Work). */
+function copyTransaction(record: WagerTransactionRecord, t: WagerTransaction, observedBalance?: Money): WagerTransactionRecord {
+  return Object.assign(record, {
     id: t.id,
     providerId: t.providerId,
     externalTransactionId: t.externalTransactionId,
@@ -240,5 +268,7 @@ function toTransactionRecord(t: WagerTransaction, observedBalance?: Money): Wage
     processedAt: t.processedAt ?? null,
     observedBalanceAmount: observedBalance?.toJSON().amount ?? null,
     observedBalanceCurrency: observedBalance?.currency ?? null,
+    referenceAttempts: t.referenceAttempts,
+    nextReferenceAttemptAt: t.nextReferenceAttemptAt ?? null,
   });
 }

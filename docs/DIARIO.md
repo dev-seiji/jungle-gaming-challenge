@@ -434,6 +434,60 @@ No Docker: `docker compose up → app roda migration:up → sobe o Nest`. Valida
 
 ---
 
+## Fase 7 — Worker de PENDING_REFERENCE
+
+### O que foi feito
+
+- Criei o worker agendado (dentro do app, a cada ~1s) que reprocessa REFUND e ROLLBACK que chegaram **antes** da referência.
+  - Se a referência chegou: aplica com as **mesmas regras** do HTTP e da fila.
+  - Se ainda não chegou: agenda nova tentativa com backoff exponencial.
+  - Se esgotou: `REJECTED` com `REFERENCE_NOT_FOUND`, mais o evento `WagerTransactionRejected`.
+- **Limite:** 8 tentativas, com espera de 5s, 10s, 20s, 40s, 80s, 160s, 320s e 640s (~21 min no total). Decisão do Gabriel.
+- Criei a 3ª migration: colunas `reference_attempts` e `next_reference_attempt_at`, mais um índice parcial só das pendentes.
+- **Refatoração:** a parte "validar a referência e aplicar na wallet" saiu do caso de uso para uma função compartilhada (`decideAndApply`). O worker não copia nenhuma regra.
+- 6 testes de integração, mais 2 testes unitários do cronograma de tentativas.
+
+### Fluxo
+
+`a cada 1s → BEGIN → pega 1 PENDING_REFERENCE vencida FOR UPDATE SKIP LOCKED → trava a wallet (FOR UPDATE) → busca a referência → chegou e válida: aplica (ledger + saldo) = PROCESSED + eventos / chegou e inválida: REJECTED com o código / não chegou: tentativas + 1 e próxima com backoff / esgotou: REJECTED REFERENCE_NOT_FOUND + evento → COMMIT`
+
+### Conceitos novos
+
+- **Reprocessamento agendado com backoff.** Em vez de rejeitar na hora uma operação que chegou fora de ordem, o sistema espera um pouco e tenta de novo, esperando cada vez mais (5s, 10s, 20s…).
+  *Analogia:* o carteiro que não achou ninguém em casa volta amanhã, depois em dois dias, depois em quatro, e na 8ª vez devolve a carta ao remetente.
+- **Lock em duas linhas sem deadlock.** O worker trava a pendente (SKIP LOCKED) e depois a wallet. O caminho normal trava só a wallet e nunca trava uma transação pendente. Como ninguém faz o caminho inverso (wallet → pendente), não existe ciclo de espera, então não há deadlock.
+- **Refatorar para não duplicar regra.** Duas cópias da mesma regra (uma no HTTP, outra no worker) acabariam divergindo. Com uma função só, as duas entradas obedecem exatamente às mesmas regras.
+
+### Decisões e alternativas descartadas
+
+- **8 tentativas em ~21 min** (decisão do Gabriel). Referência fora de ordem costuma chegar em segundos; 21 min cobre até um lote atrasado do provedor. Depois disso, o provedor precisa de uma resposta definitiva, em vez de algo pendurado para sempre.
+- **Contador e backoff no domínio** (`markPendingReference(now)`, `registerFailedReferenceAttempt(now)`, que devolve `'retry'` ou `'exhausted'`), como no `OutboxMessage`. A regra do tempo fica testável sem banco.
+- **Uma pendente por transação SQL:** a transação fica curta, e uma pendente problemática não segura as outras.
+- **Replay de uma transação que estava pendente devolve o estado atual** (PROCESSED ou REJECTED, decidido pelo worker), não mais o 202. É o "resultado original" final da operação, que o provedor precisa saber.
+- **Testes provam que testam:** sem o `SKIP LOCKED` na busca das pendentes, o teste dos dois workers falha. Os dois pegaram a mesma pendente, e o segundo, com uma cópia desatualizada, **sobrescreveu um REFUND PROCESSED com REJECTED**. É o exemplo perfeito do que o lock evita.
+- **Os testes não assumem que o banco está vazio:** eles rodam o worker até não sobrar pendente vencida, porque outros testes deixam pendentes no banco.
+
+### Perguntas prováveis da banca
+
+- **"O que acontece com um REFUND que chega antes da BET?"** Ele é gravado como `PENDING_REFERENCE` (resposta 202), com o evento correspondente. Quando a BET chega, o worker aplica o REFUND na próxima tentativa, com as mesmas regras de sempre. Teste: REFUND → BET → worker → saldo volta a 100, e o ledger tem débito e crédito.
+- **"E se a BET nunca chegar?"** Depois de 8 tentativas (~21 min), o REFUND vira `REJECTED` com `REFERENCE_NOT_FOUND`, e o evento `WagerTransactionRejected` vai para a outbox. O teste avança o relógio e confere as 8 tentativas, uma por rodada.
+- **"Por que esse limite e não outro?"** Para equilibrar duas coisas: dar tempo para a referência atrasada chegar (segundos ou minutos) e não deixar o provedor sem resposta. Os valores são constantes, fáceis de ajustar se o provedor tiver outro padrão de atraso.
+- **"Dois workers podem processar a mesma pendente?"** Não. O `FOR UPDATE SKIP LOCKED` faz o segundo pular a linha. Sem ele, o teste mostra o estrago: um REFUND já aplicado sobrescrito como rejeitado.
+
+### Arquivos principais da fase
+
+- `src/database/migrations/Migration20261122020000_PendingReferenceRetry.ts`: as colunas de tentativas e o índice parcial das pendentes.
+- `src/domain/wager-transaction.ts`: o limite (8), o backoff e a contagem de tentativas.
+- `src/application/process-wager-transaction.ts`: `decideAndApply` e `reject`, compartilhados.
+- `src/application/resolve-pending-reference.ts`: o caso de uso do worker.
+- `src/application/wager-store.ts` / `src/infrastructure/persistence/postgres-wager-store.ts`: `claimDuePendingReference` (SKIP LOCKED) e `updateTransaction`.
+- `src/infrastructure/persistence/records.ts`: mapeia as colunas novas.
+- `src/infrastructure/scheduling/pending-reference-worker.ts`: o loop (start/stop, desligável por variável de ambiente).
+- `src/app.module.ts`: registra o worker.
+- `test/integration/pending-reference.test.ts`: 6 testes. `test/unit/wager-transaction.test.ts`: o cronograma de tentativas.
+
+---
+
 ## Pendências (fazer se sobrar tempo)
 
-- [ ] **Banco separado para os testes** (vale também para o consumidor SQS da Fase 6, que tem a mesma restrição) (ex.: `wagering_test` no mesmo Postgres). Hoje o container `app` usa o mesmo banco dos testes e precisa estar parado durante o `bun test` (`docker compose stop app`), senão o publisher dele disputa os eventos com o teste da outbox. Com um banco de teste, `docker compose up` e `bun test` rodariam juntos.
+- [ ] **Banco separado para os testes** (vale também para o consumidor SQS da Fase 6 e o worker de pendentes da Fase 7, que têm a mesma restrição) (ex.: `wagering_test` no mesmo Postgres). Hoje o container `app` usa o mesmo banco dos testes e precisa estar parado durante o `bun test` (`docker compose stop app`), senão o publisher dele disputa os eventos com o teste da outbox. Com um banco de teste, `docker compose up` e `bun test` rodariam juntos.

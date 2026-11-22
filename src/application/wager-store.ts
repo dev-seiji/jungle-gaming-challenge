@@ -23,6 +23,11 @@ export interface WagerUnitOfWork {
   /** A referência já tem uma reversão (REFUND/ROLLBACK) aplicada? */
   isAlreadyReversed(referenceTransactionId: string): Promise<boolean>;
 
+  /** Pega UMA transação PENDING_REFERENCE vencida, travada com SKIP LOCKED (worker da Fase 7). */
+  claimDuePendingReference(now: Date): Promise<WagerTransaction | undefined>;
+  /** Atualiza uma transação pega por claimDuePendingReference. */
+  updateTransaction(transaction: WagerTransaction, observedBalance?: Money): void;
+
   /** Lança WalletAlreadyExistsError se já existe wallet para (playerId, currency). */
   addWallet(wallet: Wallet): Promise<void>;
   addTransaction(transaction: WagerTransaction, observedBalance?: Money): Promise<void>;

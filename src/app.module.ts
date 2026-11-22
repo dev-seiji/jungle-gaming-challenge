@@ -11,6 +11,8 @@ import { PostgresQueries } from './infrastructure/persistence/postgres-queries';
 import { PostgresWagerStore } from './infrastructure/persistence/postgres-wager-store';
 import { OutboxPublisher } from './infrastructure/messaging/outbox-publisher';
 import { WagerConsumer } from './infrastructure/messaging/wager-consumer';
+import { PendingReferenceWorker } from './infrastructure/scheduling/pending-reference-worker';
+import { ResolvePendingReference } from './application/resolve-pending-reference';
 import { AuthGuard } from './http/auth.guard';
 import { HttpErrorFilter } from './http/http-error.filter';
 import { WageringController } from './http/wagering.controller';
@@ -36,6 +38,11 @@ import { WalletsController } from './http/wallets.controller';
       provide: WagerConsumer,
       useFactory: (p: ProcessWagerTransaction, q: PostgresQueries, sqs: SQSClient) => new WagerConsumer(p, q, sqs),
       inject: [ProcessWagerTransaction, PostgresQueries, SQSClient],
+    },
+    {
+      provide: PendingReferenceWorker,
+      useFactory: (s: PostgresWagerStore) => new PendingReferenceWorker(new ResolvePendingReference(s)),
+      inject: [PostgresWagerStore],
     },
     { provide: APP_FILTER, useClass: HttpErrorFilter },
     AuthGuard,

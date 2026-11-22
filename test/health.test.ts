@@ -12,6 +12,7 @@ beforeAll(async () => {
   // Workers em segundo plano desligados: senão disputariam fila/outbox com os testes do consumidor e do publisher.
   process.env.OUTBOX_PUBLISHER_ENABLED = 'false';
   process.env.SQS_CONSUMER_ENABLED = 'false';
+  process.env.PENDING_REFERENCE_WORKER_ENABLED = 'false';
   app = await NestFactory.create(AppModule, { logger: false });
   await app.listen(0); // porta livre qualquer, para não brigar com um app já rodando
   baseUrl = await app.getUrl();

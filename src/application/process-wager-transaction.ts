@@ -137,82 +137,106 @@ export class ProcessWagerTransaction {
       return replay(existing);
     }
 
-    // 3) Regras que não dependem de saldo.
-    if (!wallet) return this.reject(uow, tx, FailureCode.WalletNotFound, undefined, eventCtx);
-    if (wallet.playerId !== tx.playerId) return this.reject(uow, tx, FailureCode.WalletPlayerMismatch, wallet, eventCtx);
-    if (wallet.currency !== tx.money.currency) return this.reject(uow, tx, FailureCode.CurrencyMismatch, wallet, eventCtx);
-
-    let reference: WagerTransaction | undefined;
-    if (tx.referenceExternalTransactionId) {
-      reference = (await uow.findByExternalId(tx.providerId, tx.referenceExternalTransactionId))?.transaction;
-      // Referência ainda não chegou (ou chegou e ainda não foi decidida): espera, não rejeita (regra 8).
-      if (!reference || !reference.isTerminal()) {
-        tx.markPendingReference();
-        await uow.addTransaction(tx, wallet.balance);
-        this.publish(uow, WagerTransactionPendingReference.from(tx, eventCtx));
-        return result(tx, wallet.balance);
-      }
-      const code = tx.checkReference(reference);
-      if (code) return this.reject(uow, tx, code, wallet, eventCtx);
-      // Seguro contra corrida porque estamos com o lock da wallet (a referência é da mesma wallet).
-      // Mesmo assim o índice único wager_tx_single_reversal_uq continua como última barreira.
-      if (tx.requiresReference() && (await uow.isAlreadyReversed(reference.id))) {
-        return this.reject(uow, tx, FailureCode.AlreadyReversed, wallet, eventCtx);
-      }
-    }
-
-    // 4) LOSS: registra o resultado sem mover saldo, sem ledger, sem WalletBalanceChanged.
-    if (!tx.affectsBalance()) {
-      tx.markProcessed(reference?.id, at);
-      await uow.addTransaction(tx, wallet.balance);
-      this.publish(uow, WagerTransactionProcessed.from(tx, wallet, eventCtx));
-      return result(tx, wallet.balance);
-    }
-
-    // 5) Movimenta o saldo. Wallet garante: saldo + version + lançamento mudam juntos ou nada muda.
-    let entry;
-    try {
-      entry =
-        tx.ledgerDirectionFor(reference) === LedgerDirection.Debit
-          ? wallet.debit(tx.money, tx.id, at)
-          : wallet.credit(tx.money, tx.id, at);
-    } catch (error) {
-      if (error instanceof InsufficientBalanceError) {
-        return this.reject(uow, tx, tx.insufficientBalanceCode(), wallet, eventCtx);
-      }
-      throw error;
-    }
-
-    tx.markProcessed(reference?.id, at);
-    await uow.addTransaction(tx, wallet.balance); // antes do ledger: o lançamento tem FK para a transação
-    uow.saveWallet(wallet);
-    uow.addLedgerEntry(entry);
-    this.publish(uow, WagerTransactionProcessed.from(tx, wallet, eventCtx));
-    this.publish(uow, WalletBalanceChanged.from(wallet, entry, eventCtx));
-    return result(tx, wallet.balance);
-  }
-
-  /** Rejeição de negócio: grava a transação REJECTED (key "queimada") + evento. Saldo e ledger intactos. */
-  private async reject(
-    uow: WagerUnitOfWork,
-    tx: WagerTransaction,
-    code: FailureCode,
-    wallet: Wallet | undefined,
-    eventCtx: EventContext,
-  ): Promise<ProcessResult> {
-    tx.reject(code);
-    await uow.addTransaction(tx, wallet?.balance);
-    this.publish(uow, WagerTransactionRejected.from(tx, eventCtx));
-    return result(tx, wallet?.balance);
-  }
-
-  // Evento vai para a outbox, na mesma transação SQL. Publicar no SQS só depois do commit (Fase 5).
-  private publish(uow: WagerUnitOfWork, event: IntegrationEvent<unknown>): void {
-    uow.addOutbox(OutboxMessage.enqueue(event));
+    // 3..5) Regras de negócio + efeito na wallet (compartilhado com o worker de PENDING_REFERENCE).
+    return decideAndApply(uow, tx, wallet, eventCtx, (t, b) => uow.addTransaction(t, b), async (w) => {
+      // Referência ainda não chegou (ou ainda não foi decidida): espera, não rejeita (regra 8).
+      tx.markPendingReference(at);
+      await uow.addTransaction(tx, w.balance);
+      publish(uow, WagerTransactionPendingReference.from(tx, eventCtx));
+      return result(tx, w.balance);
+    });
   }
 }
 
-function result(tx: WagerTransaction, balance: Money | undefined, idempotentReplay = false): ProcessResult {
+/** Grava a transação: INSERT na entrada (HTTP/fila), UPDATE no worker de PENDING_REFERENCE. */
+export type PersistTransaction = (tx: WagerTransaction, observedBalance?: Money) => Promise<void>;
+
+/**
+ * Regras de negócio e efeito na wallet, iguais para a entrada (HTTP/fila) e para o worker de
+ * PENDING_REFERENCE — uma regra só, sem cópia. Pré-condição: a wallet já está travada pelo chamador.
+ * `onMissingReference` é o único ponto que muda: a entrada marca PENDING_REFERENCE; o worker agenda
+ * nova tentativa ou, esgotado o limite, rejeita com REFERENCE_NOT_FOUND.
+ */
+export async function decideAndApply(
+  uow: WagerUnitOfWork,
+  tx: WagerTransaction,
+  wallet: Wallet | undefined,
+  eventCtx: EventContext,
+  persist: PersistTransaction,
+  onMissingReference: (wallet: Wallet) => Promise<ProcessResult>,
+): Promise<ProcessResult> {
+  const at = eventCtx.occurredAt;
+
+  // Regras que não dependem de saldo.
+  if (!wallet) return reject(uow, tx, FailureCode.WalletNotFound, undefined, eventCtx, persist);
+  if (wallet.playerId !== tx.playerId) return reject(uow, tx, FailureCode.WalletPlayerMismatch, wallet, eventCtx, persist);
+  if (wallet.currency !== tx.money.currency) return reject(uow, tx, FailureCode.CurrencyMismatch, wallet, eventCtx, persist);
+
+  let reference: WagerTransaction | undefined;
+  if (tx.referenceExternalTransactionId) {
+    reference = (await uow.findByExternalId(tx.providerId, tx.referenceExternalTransactionId))?.transaction;
+    if (!reference || !reference.isTerminal()) return onMissingReference(wallet);
+    const code = tx.checkReference(reference);
+    if (code) return reject(uow, tx, code, wallet, eventCtx, persist);
+    // Seguro contra corrida porque estamos com o lock da wallet (a referência é da mesma wallet).
+    // Mesmo assim o índice único wager_tx_single_reversal_uq continua como última barreira.
+    if (tx.requiresReference() && (await uow.isAlreadyReversed(reference.id))) {
+      return reject(uow, tx, FailureCode.AlreadyReversed, wallet, eventCtx, persist);
+    }
+  }
+
+  // LOSS: registra o resultado sem mover saldo, sem ledger, sem WalletBalanceChanged.
+  if (!tx.affectsBalance()) {
+    tx.markProcessed(reference?.id, at);
+    await persist(tx, wallet.balance);
+    publish(uow, WagerTransactionProcessed.from(tx, wallet, eventCtx));
+    return result(tx, wallet.balance);
+  }
+
+  // Movimenta o saldo. Wallet garante: saldo + version + lançamento mudam juntos ou nada muda.
+  let entry;
+  try {
+    entry =
+      tx.ledgerDirectionFor(reference) === LedgerDirection.Debit
+        ? wallet.debit(tx.money, tx.id, at)
+        : wallet.credit(tx.money, tx.id, at);
+  } catch (error) {
+    if (error instanceof InsufficientBalanceError) {
+      return reject(uow, tx, tx.insufficientBalanceCode(), wallet, eventCtx, persist);
+    }
+    throw error;
+  }
+
+  tx.markProcessed(reference?.id, at);
+  await persist(tx, wallet.balance); // antes do ledger: o lançamento tem FK para a transação
+  uow.saveWallet(wallet);
+  uow.addLedgerEntry(entry);
+  publish(uow, WagerTransactionProcessed.from(tx, wallet, eventCtx));
+  publish(uow, WalletBalanceChanged.from(wallet, entry, eventCtx));
+  return result(tx, wallet.balance);
+}
+
+/** Rejeição de negócio: grava a transação REJECTED (key "queimada") + evento. Saldo e ledger intactos. */
+export async function reject(
+  uow: WagerUnitOfWork,
+  tx: WagerTransaction,
+  code: FailureCode,
+  wallet: Wallet | undefined,
+  eventCtx: EventContext,
+  persist: PersistTransaction,
+): Promise<ProcessResult> {
+  tx.reject(code);
+  await persist(tx, wallet?.balance);
+  publish(uow, WagerTransactionRejected.from(tx, eventCtx));
+  return result(tx, wallet?.balance);
+}
+
+// Evento vai para a outbox, na mesma transação SQL. Publicar no SQS só depois do commit (Fase 5).
+function publish(uow: WagerUnitOfWork, event: IntegrationEvent<unknown>): void {
+  uow.addOutbox(OutboxMessage.enqueue(event));
+}
+
+export function result(tx: WagerTransaction, balance: Money | undefined, idempotentReplay = false): ProcessResult {
   return {
     transactionId: tx.id,
     status: tx.status,

@@ -51,6 +51,8 @@ export class WagerTransactionRecord {
   processedAt?: Date | null;
   observedBalanceAmount?: string | null;
   observedBalanceCurrency?: string | null;
+  referenceAttempts!: number;
+  nextReferenceAttemptAt?: Date | null;
 }
 
 export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
@@ -77,6 +79,8 @@ export const WagerTransactionSchema = new EntitySchema<WagerTransactionRecord>({
     processedAt: { type: 'Date', nullable: true },
     observedBalanceAmount: { type: 'decimal', precision: 20, scale: 2, nullable: true },
     observedBalanceCurrency: { type: 'string', length: 3, nullable: true },
+    referenceAttempts: { type: 'integer' },
+    nextReferenceAttemptAt: { type: 'Date', nullable: true },
   },
 });
 
