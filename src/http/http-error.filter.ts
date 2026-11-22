@@ -5,7 +5,7 @@ import { isTransientDbError } from '../infrastructure/persistence/transient-erro
 
 export interface HttpError {
   status: number;
-  body: { error: string; message: string; retryable: boolean };
+  body: { error: string; message: string; retryable: boolean; walletId?: string };
 }
 
 /**
@@ -20,7 +20,7 @@ export function toHttpError(error: unknown): HttpError {
     return { status: 409, body: { error: 'IDEMPOTENCY_CONFLICT', message, retryable: false } };
   }
   if (error instanceof WalletAlreadyExistsError) {
-    return { status: 409, body: { error: 'WALLET_ALREADY_EXISTS', message, retryable: false } };
+    return { status: 409, body: { error: 'WALLET_ALREADY_EXISTS', message, retryable: false, walletId: error.walletId } };
   }
   if (isTransientDbError(error)) {
     return { status: 503, body: { error: 'TRANSIENT_FAILURE', message: 'temporarily unavailable, retry later', retryable: true } };

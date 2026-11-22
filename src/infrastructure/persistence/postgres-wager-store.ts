@@ -95,6 +95,11 @@ class PostgresUnitOfWork implements WagerUnitOfWork {
     return count > 0;
   }
 
+  async findWalletByPlayer(playerId: string, currency: string): Promise<Wallet | undefined> {
+    const record = await this.em.findOne(WalletRecord, { playerId, currency });
+    return record ? toWallet(record) : undefined;
+  }
+
   async addWallet(wallet: Wallet): Promise<void> {
     this.em.persist(
       Object.assign(new WalletRecord(), {

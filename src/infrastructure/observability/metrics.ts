@@ -66,7 +66,14 @@ export function useOutboxSource(orm: MikroORM): void {
   outboxOrm = orm;
 }
 
-async function outboxStats(): Promise<{ pending: number; lagSeconds: number }> {
+// O prom-client coleta os gauges em paralelo: os dois gauges da outbox compartilham UMA consulta em andamento.
+let outboxQuery: Promise<{ pending: number; lagSeconds: number }> | undefined;
+function outboxStats() {
+  outboxQuery ??= queryOutboxStats().finally(() => (outboxQuery = undefined));
+  return outboxQuery;
+}
+
+async function queryOutboxStats(): Promise<{ pending: number; lagSeconds: number }> {
   if (!outboxOrm) return { pending: 0, lagSeconds: 0 };
   const [row] = await outboxOrm.em
     .fork()

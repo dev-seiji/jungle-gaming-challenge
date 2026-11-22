@@ -5,7 +5,8 @@ import { OutboxMessage } from '../domain/outbox-message';
 import { payloadHash } from '../domain/payload-hash';
 import { WagerTransaction } from '../domain/wager-transaction';
 import { Wallet } from '../domain/wallet';
-import type { WagerStore } from './wager-store';
+import type { WalletLedgerEntry } from '../domain/wallet-ledger-entry';
+import { type WagerStore, WalletAlreadyExistsError } from './wager-store';
 
 export interface CreateWalletCommand {
   playerId: string;
@@ -48,6 +49,24 @@ export class CreateWallet {
       at,
     });
 
+    try {
+      return await this.persist(wallet, opening, openingEntry, at, ctx.correlationId);
+    } catch (error) {
+      if (!(error instanceof WalletAlreadyExistsError)) throw error;
+      // A violação da unique abortou a transação; a busca vai numa transação nova. Devolver o id existente
+      // permite ao cliente que reenviou o POST (ex.: depois de um timeout) seguir com a wallet já criada.
+      const existing = await this.store.transaction((uow) => uow.findWalletByPlayer(wallet.playerId, wallet.currency));
+      throw new WalletAlreadyExistsError(error.message, existing?.id);
+    }
+  }
+
+  private persist(
+    wallet: Wallet,
+    opening: WagerTransaction | undefined,
+    openingEntry: WalletLedgerEntry | undefined,
+    at: Date,
+    correlationId: string,
+  ): Promise<WalletView> {
     // Wallet + OPENING + ledger + eventos: tudo na mesma transação SQL.
     return this.store.transaction(async (uow) => {
       await uow.addWallet(wallet);
@@ -55,7 +74,7 @@ export class CreateWallet {
         opening.markProcessed(undefined, at);
         await uow.addTransaction(opening, wallet.balance);
         uow.addLedgerEntry(openingEntry);
-        const eventCtx: EventContext = { correlationId: ctx.correlationId, occurredAt: at };
+        const eventCtx: EventContext = { correlationId, occurredAt: at };
         uow.addOutbox(OutboxMessage.enqueue(WagerTransactionProcessed.from(opening, wallet, eventCtx)));
         uow.addOutbox(OutboxMessage.enqueue(WalletBalanceChanged.from(wallet, openingEntry, eventCtx)));
       }

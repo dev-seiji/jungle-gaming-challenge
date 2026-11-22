@@ -182,6 +182,8 @@ Um único `ExceptionFilter` traduz erro em status, então o mapeamento é o mesm
 | rejeição de negócio (`failureCode`) | 422 | não |
 | falha transitória (conexão, `lock_timeout`, deadlock, Postgres reiniciando) | 503 | **sim** |
 
+No 409 de wallet duplicada, o corpo traz o `walletId` da wallet que já existe. Criar wallet não tem idempotency key, então um cliente que reenvia o `POST /wallets` depois de um timeout recupera o id por aqui.
+
 O replay devolve **o mesmo status** da primeira vez ("requisição idêntica → mesma resposta"); quem diferencia é `idempotentReplay`. Por isso uma transação processada é `200`, e não `201`.
 
 ---

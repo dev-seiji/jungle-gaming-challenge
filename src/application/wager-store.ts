@@ -28,6 +28,7 @@ export interface WagerUnitOfWork {
   /** Atualiza uma transação pega por claimDuePendingReference. */
   updateTransaction(transaction: WagerTransaction, observedBalance?: Money): void;
 
+  findWalletByPlayer(playerId: string, currency: string): Promise<Wallet | undefined>;
   /** Lança WalletAlreadyExistsError se já existe wallet para (playerId, currency). */
   addWallet(wallet: Wallet): Promise<void>;
   addTransaction(transaction: WagerTransaction, observedBalance?: Money): Promise<void>;
@@ -55,6 +56,13 @@ export class DuplicateMessageError extends Error {
 /** Já existe wallet para esse jogador nessa moeda (unique no banco). */
 export class WalletAlreadyExistsError extends Error {
   override name = 'WalletAlreadyExistsError';
+  /** Id da wallet que já existe: o cliente que reenviou o POST depois de um timeout recupera o id por aqui. */
+  constructor(
+    message: string,
+    readonly walletId?: string,
+  ) {
+    super(message);
+  }
 }
 
 /** Mesma idempotency key (ou mesmo externalTransactionId) com conteúdo diferente: conflito, não replay. */

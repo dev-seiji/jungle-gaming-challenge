@@ -674,6 +674,17 @@ No Docker: `docker compose up → app roda migration:up → sobe o Nest`. Valida
 
 ---
 
+## Ajustes do review final (ponytail-review)
+
+- **`POST /wallets` duplicado devolve o `walletId` existente no 409.**
+  - **Cenário:** o cliente cria a wallet, a resposta se perde (timeout), e ele reenvia. Ele recebia 409 sem nenhum jeito de descobrir o id, porque não existe busca por jogador.
+  - **Detalhe técnico:** a violação da unique **aborta a transação** no Postgres. Por isso a busca da wallet existente é feita numa transação nova, depois do erro.
+  - **Teste:** o teste HTTP confere que o `walletId` do 409 é o da primeira criação.
+- **`/metrics`: as duas métricas da outbox compartilham uma única consulta por coleta.** A primeira ideia, "um gauge preenche os dois valores", estava **errada**: lendo o código do `prom-client`, vimos que ele coleta todos os gauges em paralelo (`Promise.all`), e o gauge de pendentes mostraria o valor da coleta anterior. A correção certa reaproveita a mesma consulta em andamento.
+- **`.DS_Store` no `.gitignore`** (arquivo que o macOS cria sozinho nas pastas).
+
+---
+
 ## Pendências
 
 - [x] **Banco separado para os testes:** feito (seção anterior).

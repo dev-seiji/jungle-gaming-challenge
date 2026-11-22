@@ -87,10 +87,12 @@ describe('POST /wallets', () => {
 
   test('409 for a second wallet of the same player and currency; another currency is fine', async () => {
     const playerId = Bun.randomUUIDv7();
-    await call('POST', '/wallets', { playerId, initialBalance: brl('10.00') });
+    const first = await call('POST', '/wallets', { playerId, initialBalance: brl('10.00') });
     const dup = await call('POST', '/wallets', { playerId, initialBalance: brl('10.00') });
     expect(dup.status).toBe(409);
     expect(dup.body.error).toBe('WALLET_ALREADY_EXISTS');
+    // Cliente que reenviou o POST depois de um timeout recupera o id da wallet já criada.
+    expect(dup.body.walletId).toBe(first.body.id);
     const usd = await call('POST', '/wallets', { playerId, initialBalance: { amount: '10.00', currency: 'USD' } });
     expect(usd.status).toBe(201);
   });

@@ -114,7 +114,7 @@ docker compose exec ministack sh -c 'aws --endpoint-url http://localhost:4566 sq
 | `202` | aceito, aguardando a transação referenciada (`PENDING_REFERENCE`) | não precisa |
 | `400` | payload inválido | não, corrija o payload |
 | `404` | recurso não existe (consultas) | — |
-| `409` | conflito de idempotência ou wallet duplicada | não |
+| `409` | conflito de idempotência ou wallet duplicada (o corpo traz o `walletId` existente) | não |
 | `422` | rejeitado por regra de negócio (`failureCode` no corpo) | não, decida pelo `failureCode` |
 | `503` | falha transitória (banco fora, lock ocupado) | **sim, com a mesma `Idempotency-Key`** |
 
